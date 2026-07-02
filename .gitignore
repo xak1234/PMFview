@@ -1,0 +1,22 @@
+# local state / personal data — not part of the published tool
+.omc/
+pmf_out/
+pmf_out2/
+pmf_extracted/
+*.pmf
+*.pmfindex
+*.pathindex
+__pycache__/
+*.pyc
+
+# earlier reverse-engineering probes (superseded by pmfview.py, kept locally)
+pmf_viewer.py
+pmf_path_chain.py
+pmf_path_chain2.py
+pmf_path_re.py
+pmf_path_re2.py
+pmf_probe_dir.py
+pmf_probe_entries.py
+pmf_probe_i30.py
+pmf_probe_users_hex.py
+pmf_test_paths.py
