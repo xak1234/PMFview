@@ -22,6 +22,21 @@ python pmfview.py backup.pmf cat "Windows\System32\drivers\etc\hosts"
 python pmfview_gui.py backup.pmf
 ```
 
+## MCP server
+
+`pmfview_mcp.py` exposes the same capabilities as MCP tools (stdio transport),
+so an AI agent can investigate images and extract files directly. Requires the
+`mcp` package (`pip install mcp`). Register with Claude Code:
+
+```
+claude mcp add pmfview --scope user -- python path\to\pmfview_mcp.py
+```
+
+Tools: `pmf_open`, `pmf_info`, `pmf_ls`, `pmf_tree`, `pmf_find`, `pmf_stat`,
+`pmf_read` (inline text/hex preview), `pmf_hash` (md5/sha1/sha256), and
+`pmf_extract` (recursive, glob-capable, preserves mtimes). All tools take the
+image path and open/index images on first use.
+
 - The first open builds an index cache (`<image>.pmfindex`, ~1 min for a 1.3M-file
   image); subsequent opens load in seconds. `index --rebuild` forces a refresh.
 - `extract` accepts directories (recursive), multiple paths, and full-path globs
@@ -81,6 +96,7 @@ name + parent MFT reference (root is MFT #5) — `$I30` indexes are not needed.
 
 - `pmfview.py` — library + CLI (the actual parser)
 - `pmfview_gui.py` — tkinter GUI on top of pmfview
+- `pmfview_mcp.py` — MCP server on top of pmfview (stdio)
 
 ## Limitations
 
