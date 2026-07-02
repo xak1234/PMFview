@@ -7,6 +7,8 @@ without restoring the whole partition.
 
 No dependencies beyond Python 3.9+ (GUI uses stdlib tkinter).
 
+![PMF Viewer](docs/screenshot.png)
+
 ## Usage
 
 ```

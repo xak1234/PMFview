@@ -108,6 +108,10 @@ def human(n: int) -> str:
     return f"{n}"
 
 
+def _clean_ascii(d: bytes) -> str:
+    return "".join(chr(b) for b in d if 32 <= b < 127).strip()
+
+
 def utf16z(d: bytes, off: int, maxbytes: int) -> str:
     end = off + maxbytes
     i = off
@@ -186,9 +190,9 @@ class PmfImage:
         return Header(
             path=self.path,
             file_size=self.file_size,
-            filesystem=h[0x0C:0x10].decode("ascii", "replace").rstrip("\x00"),
-            disk_model=h[0x11:0x31].decode("ascii", "replace").rstrip("\x00"),
-            serial=h[0x41:0x51].decode("ascii", "replace").rstrip("\x00"),
+            filesystem=_clean_ascii(h[0x0C:0x10]),
+            disk_model=_clean_ascii(h[0x11:0x31]),
+            serial=_clean_ascii(h[0x41:0x51]),
             image_name=utf16z(h, 0x252, 0x20),
             created=created,
         )
