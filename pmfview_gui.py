@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-PMF Viewer — professional dark-themed browser/extractor for DiskGenius .pmf
-partition backup images (read-only).
+PMF Viewer — professional dark-themed browser/extractor/creator for DiskGenius
+.pmf partition backup images.
 
 Usage:  python pmfview_gui.py [image.pmf]
 
-Standard library only (tkinter). All format parsing lives in pmfview.py.
+Standard library only (tkinter). All format parsing and writing lives in pmfview.py.
 The first open of an image builds an index cache (<image>.pmfindex); later
 opens load in seconds.
 """
@@ -21,9 +21,9 @@ import threading
 import tkinter as tk
 import tkinter.font as tkfont
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, ttk
 
-from pmfview import Entry, PmfError, PmfImage, ft_str, ft_to_unix, human, _safe_rel
+from pmfview import Entry, PmfError, PmfImage, create_pmf_image, ft_str, ft_to_unix, human, _safe_rel
 
 # ---------------------------------------------------------------- theme ----
 
@@ -177,6 +177,10 @@ class App:
                                    command=self.open_dialog)
         self.btn_open.pack(side="left")
 
+        self.btn_create = ttk.Button(bar, text="Create Image…",
+                                     command=self.create_dialog)
+        self.btn_create.pack(side="left", padx=(8, 0))
+
         self.btn_extract = ttk.Button(bar, text="Extract Selected…",
                                       command=self.extract_selected, state="disabled")
         self.btn_extract.pack(side="left", padx=(8, 0))
@@ -293,11 +297,11 @@ class App:
         if busy:
             self.pbar.pack(fill="x", side="top")
             self.pbar.start(14)
-            self.status_l.configure(text=text or "Working…")
+            self.status_l.configure(text=text or "Working…", foreground=FG_DIM)
         else:
             self.pbar.stop()
             self.pbar.pack_forget()
-        for b in (self.btn_open, self.btn_extract):
+        for b in (self.btn_open, self.btn_create, self.btn_extract):
             b.state(["disabled"] if busy else ["!disabled"])
         if not busy and self.img is None:
             self.btn_extract.state(["disabled"])
@@ -310,6 +314,34 @@ class App:
             filetypes=[("PMF images", "*.pmf"), ("All files", "*.*")])
         if p:
             self.open_image(Path(p))
+
+    def create_dialog(self):
+        CreateImageWindow(self.root, self.create_image)
+
+    def create_image(self, out_path: Path, sources: list[Path]):
+        names = ", ".join(p.name for p in sources[:3])
+        if len(sources) > 3:
+            names += f", +{len(sources) - 3} more"
+        self._set_busy(True, f"Creating {out_path.name} from {names}…")
+
+        def progress(n, total, _entry):
+            if n == total or n % 200 == 0:
+                self.q.put(("status", f"Creating image… {n:,}/{total:,} entries"))
+
+        def work():
+            try:
+                files, dirs, total = create_pmf_image(
+                    out_path,
+                    sources,
+                    image_name=out_path.stem,
+                    overwrite=True,
+                    progress=progress,
+                )
+                self.q.put(("create_done", (out_path, files, dirs, total)))
+            except Exception as e:
+                self.q.put(("error", f"Could not create image:\n{e}"))
+
+        threading.Thread(target=work, daemon=True).start()
 
     def open_image(self, path: Path):
         self._set_busy(True, f"Opening {path.name} — building index "
@@ -335,7 +367,8 @@ class App:
                     self._after_load()
                 elif kind == "error":
                     self._set_busy(False)
-                    messagebox.showerror("PMF Viewer", payload)
+                    self.status_l.configure(text=payload.replace("\n", " "),
+                                            foreground=WARN_RED)
                 elif kind == "status":
                     self.status_l.configure(text=payload)
                 elif kind == "extract_done":
@@ -344,16 +377,26 @@ class App:
                     msg = f"Extracted {ok:,} file(s)"
                     if fail:
                         msg += f" — {fail} FAILED"
-                    self.status_l.configure(text=f"{msg} → {out}")
-                    (messagebox.showwarning if fail else messagebox.showinfo)(
-                        "Extraction finished", f"{msg}\n\n{out}")
+                    self.status_l.configure(
+                        text=f"{msg} → {out}",
+                        foreground=WARN_RED if fail else OK_GREEN,
+                    )
+                elif kind == "create_done":
+                    self._set_busy(False)
+                    out_path, files, dirs, total = payload
+                    msg = (f"Created {out_path.name}: {files:,} files, "
+                           f"{dirs:,} folders, {human(total)}")
+                    self.status_l.configure(text=msg, foreground=OK_GREEN)
+                    self.open_image(out_path)
                 elif kind == "hash_done":
                     self._set_busy(False)
                     name, digest = payload
                     self.root.clipboard_clear()
                     self.root.clipboard_append(digest)
-                    messagebox.showinfo(
-                        "SHA-256", f"{name}\n\n{digest}\n\n(copied to clipboard)")
+                    self.status_l.configure(
+                        text=f"SHA-256 copied for {name}: {digest}",
+                        foreground=OK_GREEN,
+                    )
         except queue.Empty:
             pass
         self.root.after(80, self._poll)
@@ -609,7 +652,8 @@ class App:
             return
         e = self.img.entries[recnos[0]]
         if e.is_dir:
-            messagebox.showinfo("SHA-256", "Select a file, not a folder.")
+            self.status_l.configure(text="Select a file to calculate SHA-256.",
+                                    foreground=WARN_RED)
             return
         self._set_busy(True, f"Hashing {e.name}…")
 
@@ -635,7 +679,8 @@ class App:
         try:
             data = self.img.read_file(e, max_bytes=256 * 1024)
         except PmfError as ex:
-            messagebox.showerror("Preview", str(ex))
+            self.status_l.configure(text=f"Preview failed: {ex}",
+                                    foreground=WARN_RED)
             return
         PreviewWindow(self.root, self.img.full_path(e.recno), e, data)
 
@@ -644,8 +689,10 @@ class App:
             return
         recnos = self._selected_recnos()
         if not recnos:
-            messagebox.showinfo("Extract",
-                                "Select files or folders to extract first.")
+            self.status_l.configure(
+                text="Select files or folders to extract first.",
+                foreground=WARN_RED,
+            )
             return
         out = filedialog.askdirectory(title="Extract to folder")
         if not out:
@@ -693,6 +740,209 @@ class App:
             self.q.put(("extract_done", (ok, fail, str(out_dir))))
 
         threading.Thread(target=work, daemon=True).start()
+
+
+class CreateImageWindow(tk.Toplevel):
+    """Application-owned folder picker for building a PMF image."""
+
+    def __init__(self, master: tk.Misc, create_callback):
+        super().__init__(master, bg=BG)
+        self.create_callback = create_callback
+        self.sources: list[Path] = []
+        self._node_paths: dict[str, Path] = {}
+        self._loaded: set[str] = set()
+
+        self.title("Create PMF Image")
+        self.geometry("920x680")
+        self.minsize(720, 520)
+        self.transient(master)
+        apply_dark_titlebar(self)
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+        header = ttk.Frame(self, style="Toolbar.TFrame", padding=(16, 12))
+        header.pack(fill="x")
+        ttk.Label(header, text="Create PMF Image",
+                  style="Toolbar.TLabel",
+                  font=("Segoe UI Semibold", 13),
+                  foreground=FG).pack(side="left")
+        ttk.Label(header, text="Select folders with Ctrl or Shift",
+                  style="Toolbar.TLabel").pack(side="right")
+
+        body = ttk.Frame(self, padding=16)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=3)
+        body.columnconfigure(1, weight=2)
+        body.rowconfigure(1, weight=1)
+
+        ttk.Label(body, text="Folders").grid(row=0, column=0, sticky="w",
+                                             pady=(0, 6))
+        ttk.Label(body, text="Included in image").grid(row=0, column=1,
+                                                       sticky="w",
+                                                       padx=(14, 0),
+                                                       pady=(0, 6))
+
+        tree_wrap = ttk.Frame(body, style="Panel.TFrame", padding=1)
+        tree_wrap.grid(row=1, column=0, sticky="nsew")
+        self.folder_tree = ttk.Treeview(tree_wrap, show="tree",
+                                        selectmode="extended")
+        tree_scroll = ttk.Scrollbar(tree_wrap, orient="vertical",
+                                    command=self.folder_tree.yview)
+        self.folder_tree.configure(yscrollcommand=tree_scroll.set)
+        self.folder_tree.pack(side="left", fill="both", expand=True)
+        tree_scroll.pack(side="right", fill="y")
+        self.folder_tree.bind("<<TreeviewOpen>>", self._open_node)
+        self.folder_tree.bind("<Double-1>", lambda _e: self._add_selected())
+        self._populate_roots()
+
+        selected_wrap = ttk.Frame(body, style="Panel.TFrame", padding=1)
+        selected_wrap.grid(row=1, column=1, sticky="nsew", padx=(14, 0))
+        self.selected_list = tk.Listbox(
+            selected_wrap, bg=PANEL, fg=FG, selectbackground=SEL_BG,
+            selectforeground="#ffffff", bd=0, highlightthickness=0,
+            activestyle="none", font=("Segoe UI", 10),
+        )
+        selected_scroll = ttk.Scrollbar(selected_wrap, orient="vertical",
+                                        command=self.selected_list.yview)
+        self.selected_list.configure(yscrollcommand=selected_scroll.set)
+        self.selected_list.pack(side="left", fill="both", expand=True)
+        selected_scroll.pack(side="right", fill="y")
+
+        actions = ttk.Frame(body)
+        actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 16))
+        ttk.Button(actions, text="Add Selected Folders",
+                   command=self._add_selected).pack(side="left")
+        ttk.Button(actions, text="Remove",
+                   command=self._remove_selected).pack(side="left", padx=(8, 0))
+        ttk.Button(actions, text="Clear",
+                   command=self._clear_sources).pack(side="left", padx=(8, 0))
+
+        output = ttk.Frame(body)
+        output.grid(row=3, column=0, columnspan=2, sticky="ew")
+        output.columnconfigure(1, weight=1)
+        ttk.Label(output, text="Save in").grid(row=0, column=0, sticky="w",
+                                               padx=(0, 10), pady=4)
+        self.output_dir = tk.StringVar(value=str(Path.home()))
+        ttk.Entry(output, textvariable=self.output_dir).grid(
+            row=0, column=1, sticky="ew", pady=4)
+        ttk.Button(output, text="Use Selected Folder",
+                   command=self._use_selected_output).grid(
+            row=0, column=2, padx=(8, 0), pady=4)
+
+        ttk.Label(output, text="Image name").grid(row=1, column=0, sticky="w",
+                                                  padx=(0, 10), pady=4)
+        self.image_name = tk.StringVar(value="backup.pmf")
+        name_entry = ttk.Entry(output, textvariable=self.image_name)
+        name_entry.grid(row=1, column=1, sticky="ew", pady=4)
+
+        footer = ttk.Frame(self, style="Toolbar.TFrame", padding=(16, 10))
+        footer.pack(fill="x", side="bottom")
+        self.feedback = ttk.Label(footer, text="", style="Toolbar.TLabel")
+        self.feedback.pack(side="left", fill="x", expand=True)
+        ttk.Button(footer, text="Cancel",
+                   command=self.destroy).pack(side="right")
+        ttk.Button(footer, text="Create", style="Accent.TButton",
+                   command=self._create).pack(side="right", padx=(0, 8))
+
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.bind("<Control-Return>", lambda _e: self._create())
+        self.grab_set()
+        self.after(0, self.folder_tree.focus_set)
+
+    def _roots(self) -> list[Path]:
+        if os.name != "nt":
+            return [Path("/")]
+        mask = ctypes.windll.kernel32.GetLogicalDrives()
+        return [Path(f"{chr(65 + i)}:\\") for i in range(26)
+                if mask & (1 << i)]
+
+    def _populate_roots(self):
+        for path in self._roots():
+            node = self.folder_tree.insert("", "end", text=str(path),
+                                           open=False)
+            self._node_paths[node] = path
+            self.folder_tree.insert(node, "end", text="")
+
+    def _open_node(self, _event=None):
+        node = self.folder_tree.focus()
+        if not node or node in self._loaded:
+            return
+        self.folder_tree.delete(*self.folder_tree.get_children(node))
+        path = self._node_paths[node]
+        try:
+            children = sorted(
+                (p for p in path.iterdir() if p.is_dir() and not p.is_symlink()),
+                key=lambda p: p.name.lower(),
+            )
+        except (OSError, PermissionError):
+            children = []
+        for child in children:
+            item = self.folder_tree.insert(node, "end", text=child.name)
+            self._node_paths[item] = child
+            try:
+                if any(p.is_dir() and not p.is_symlink()
+                       for p in child.iterdir()):
+                    self.folder_tree.insert(item, "end", text="")
+            except (OSError, PermissionError):
+                pass
+        self._loaded.add(node)
+
+    def _selected_paths(self) -> list[Path]:
+        return [self._node_paths[n] for n in self.folder_tree.selection()
+                if n in self._node_paths]
+
+    def _add_selected(self):
+        for path in self._selected_paths():
+            if path not in self.sources:
+                self.sources.append(path)
+                self.selected_list.insert("end", str(path))
+        self._feedback(f"{len(self.sources)} folder(s) included", error=False)
+
+    def _remove_selected(self):
+        for index in reversed(self.selected_list.curselection()):
+            del self.sources[index]
+            self.selected_list.delete(index)
+        self._feedback(f"{len(self.sources)} folder(s) included", error=False)
+
+    def _clear_sources(self):
+        self.sources.clear()
+        self.selected_list.delete(0, "end")
+        self._feedback("", error=False)
+
+    def _use_selected_output(self):
+        paths = self._selected_paths()
+        if len(paths) != 1:
+            self._feedback("Select one folder to use as the destination.")
+            return
+        self.output_dir.set(str(paths[0]))
+        self._feedback("", error=False)
+
+    def _feedback(self, message: str, error: bool = True):
+        self.feedback.configure(text=message,
+                                foreground=WARN_RED if error else FG_DIM)
+
+    def _create(self):
+        self._add_selected()
+        if not self.sources:
+            self._feedback("Select and add at least one folder.")
+            return
+        output_dir = Path(self.output_dir.get().strip())
+        if not output_dir.is_dir():
+            self._feedback("The destination folder does not exist.")
+            return
+        name = self.image_name.get().strip()
+        if not name:
+            self._feedback("Enter an image name.")
+            return
+        if not name.lower().endswith(".pmf"):
+            name += ".pmf"
+        out_path = output_dir / name
+        if out_path.exists():
+            self._feedback("An image with that name already exists.")
+            return
+        sources = list(self.sources)
+        self.grab_release()
+        self.destroy()
+        self.create_callback(out_path, sources)
 
 
 class PreviewWindow(tk.Toplevel):

@@ -1,9 +1,9 @@
-# pmfview — DiskGenius .pmf image viewer / extractor
+# pmfview — DiskGenius .pmf image viewer / extractor / creator
 
-Read-only browser and extractor for **DiskGenius partition backup images**
+Browser, extractor, and creator for **DiskGenius partition backup images**
 (`.pmf`, "VIMG" container, created with *Backup Partition → Backup All Files*).
-Lets you list, search, and extract files from a backup without DiskGenius and
-without restoring the whole partition.
+Lets you list, search, extract files from a backup without DiskGenius, and create
+new PMF images from local folders.
 
 No dependencies beyond Python 3.9+ (GUI uses stdlib tkinter).
 
@@ -19,8 +19,9 @@ python pmfview.py backup.pmf tree "Program Files" --depth 2
 python pmfview.py backup.pmf find "*.kdbx"
 python pmfview.py backup.pmf extract "Users\me\Documents" --out D:\restored
 python pmfview.py backup.pmf cat "Windows\System32\drivers\etc\hosts"
+python pmfview.py new-backup.pmf create "D:\Photos" "D:\Documents"
 
-# GUI (tree browser + search + extract)
+# GUI (tree browser + search + extract + create)
 python pmfview_gui.py backup.pmf
 ```
 
@@ -96,7 +97,7 @@ name + parent MFT reference (root is MFT #5) — `$I30` indexes are not needed.
 
 ## Files
 
-- `pmfview.py` — library + CLI (the actual parser)
+- `pmfview.py` — library + CLI (the parser and PMF creator)
 - `pmfview_gui.py` — tkinter GUI on top of pmfview
 - `pmfview_mcp.py` — MCP server on top of pmfview (stdio)
 
@@ -105,4 +106,6 @@ name + parent MFT reference (root is MFT #5) — `$I30` indexes are not needed.
 - "Backup All Files" mode images only (file-level backups). Sector-mode
   backups are a different layout and not supported.
 - Alternate data streams (ADS) are not extracted — main file content only.
-- Read-only by design; nothing is ever written to the image.
+- Created images are written with the PMF metadata subset this tool needs for
+  browsing and extraction; compatibility with DiskGenius restore workflows has
+  not been validated.

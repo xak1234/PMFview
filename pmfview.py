@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-pmfview — read-only file viewer/extractor for DiskGenius .pmf partition images
+pmfview — file viewer/extractor/creator for DiskGenius .pmf partition images
 (VIMG container, "Backup All Files" mode).
 
 Reverse-engineered format (hash-verified against real backup images):
@@ -50,6 +50,7 @@ import io
 import os
 import pickle
 import gzip
+import platform
 import struct
 import sys
 import time
@@ -66,6 +67,7 @@ NAME_FIELD = 0x208
 RECORD_OFF = 0x240
 ATTR_SLOT = 0x248
 CHUNK_MAX = 0x10000000          # sanity cap for a single data chunk (256 MiB)
+WRITE_CHUNK = 1 << 20
 FT_MIN = 116444736000000000        # 1970-01-01
 FT_MAX = 159000000000000000        # ~2104
 INDEX_CACHE_VERSION = 3
@@ -92,6 +94,10 @@ def u64(d: bytes, o: int) -> int:
 
 def ft_to_unix(ft: int) -> float:
     return ft / 10_000_000 - EPOCH_DELTA
+
+
+def unix_to_ft(ts: float) -> int:
+    return int((ts + EPOCH_DELTA) * 10_000_000)
 
 
 def ft_str(ft: int) -> str:
@@ -158,6 +164,23 @@ class Attr:
     content_len: int
     real_size: int        # non-resident only
     init_size: int
+
+
+@dataclass
+class CreateEntry:
+    recno: int
+    parent: int
+    source: Optional[Path]
+    name: str
+    size: int
+    attr_flags: int
+    crtime: int
+    mtime: int
+    blob: int = 0
+
+    @property
+    def is_dir(self) -> bool:
+        return bool(self.attr_flags & FILE_ATTR_DIRECTORY)
 
 
 class PmfError(Exception):
@@ -561,6 +584,189 @@ class PmfImage:
 
 # ---------------- CLI ----------------
 
+def _write_utf16z(buf: bytearray, off: int, maxbytes: int, s: str) -> None:
+    raw = s.encode("utf-16-le", errors="replace")[: maxbytes - 2]
+    if len(raw) % 2:
+        raw = raw[:-1]
+    buf[off : off + len(raw)] = raw
+
+
+def _sanitize_image_name(name: str) -> str:
+    clean = "".join(c if c not in '<>:"/\\|?*' and ord(c) >= 32 else "_" for c in name)
+    return clean.rstrip(" .") or "folder"
+
+
+def _unique_name(name: str, used: set[str]) -> str:
+    base = _sanitize_image_name(name)
+    candidate = base
+    stem = Path(base).stem or base
+    suffix = Path(base).suffix
+    n = 2
+    while candidate.lower() in used:
+        candidate = f"{stem} ({n}){suffix}"
+        n += 1
+    used.add(candidate.lower())
+    return candidate
+
+
+def _make_header(out_path: Path, image_name: str) -> bytes:
+    h = bytearray(CATALOG_START)
+    h[:4] = MAGIC
+    h[0x0C:0x10] = b"NTFS"
+    model = f"pmfview {platform.system()}".encode("ascii", errors="ignore")[:0x20]
+    serial = b"PMFVIEW"
+    h[0x11 : 0x11 + len(model)] = model
+    h[0x41 : 0x41 + len(serial)] = serial
+    _write_utf16z(h, 0x252, 0x20, image_name or out_path.stem)
+    now = time.localtime()
+    struct.pack_into("<H", h, 0x274, now.tm_year)
+    h[0x276] = now.tm_mon
+    h[0x277] = now.tm_mday
+    h[0x278] = now.tm_hour
+    h[0x279] = now.tm_min
+    h[0x27A] = now.tm_sec
+    return bytes(h)
+
+
+def _build_create_entries(sources: list[Path]) -> list[CreateEntry]:
+    entries: list[CreateEntry] = []
+    path_recno: dict[Path, int] = {}
+    root_names: set[str] = set()
+    next_recno = 6
+
+    def add_entry(path: Path, parent: int, name: str) -> int:
+        nonlocal next_recno
+        st = path.stat()
+        is_dir = path.is_dir()
+        recno = next_recno
+        next_recno += 1
+        ft_m = unix_to_ft(st.st_mtime)
+        ft_c = unix_to_ft(getattr(st, "st_ctime", st.st_mtime))
+        entries.append(CreateEntry(
+            recno=recno,
+            parent=parent,
+            source=path,
+            name=name,
+            size=0 if is_dir else st.st_size,
+            attr_flags=FILE_ATTR_DIRECTORY if is_dir else 0,
+            crtime=ft_c,
+            mtime=ft_m,
+        ))
+        path_recno[path] = recno
+        return recno
+
+    for src in sources:
+        src = src.resolve()
+        if not src.exists():
+            raise PmfError(f"source not found: {src}")
+        top_name = _unique_name(src.name or src.drive.rstrip(":"), root_names)
+        top_recno = add_entry(src, 5, top_name)
+        if not src.is_dir():
+            continue
+        for dirpath, dirnames, filenames in os.walk(src):
+            cur_path = Path(dirpath)
+            cur_recno = path_recno[cur_path]
+            dirnames[:] = sorted(
+                [d for d in dirnames if not (cur_path / d).is_symlink()],
+                key=str.lower,
+            )
+            for dirname in dirnames:
+                child = cur_path / dirname
+                add_entry(child, cur_recno, _sanitize_image_name(dirname))
+            for filename in sorted(filenames, key=str.lower):
+                child = cur_path / filename
+                if child.is_symlink():
+                    continue
+                add_entry(child, cur_recno, _sanitize_image_name(filename))
+    if not entries:
+        raise PmfError("no source files or folders to write")
+    return entries
+
+
+def _make_metadata(e: CreateEntry) -> bytes:
+    attrs_off = 0x30
+    attr_count_pos = RECORD_OFF + attrs_off
+    attr_pos = attr_count_pos + 4
+    min_len = attr_pos + (0 if e.is_dir else ATTR_SLOT + 8)
+    dec = bytearray(min_len)
+    _write_utf16z(dec, 0, NAME_FIELD, e.name)
+    struct.pack_into("<Q", dec, 0x208, e.parent)
+    struct.pack_into("<Q", dec, 0x210, e.size)
+    struct.pack_into("<Q", dec, 0x218, e.crtime)
+    struct.pack_into("<Q", dec, 0x220, e.mtime)
+    struct.pack_into("<Q", dec, 0x228, e.mtime)
+    struct.pack_into("<I", dec, 0x230, e.attr_flags)
+    struct.pack_into("<Q", dec, 0x238, e.recno)
+    dec[RECORD_OFF : RECORD_OFF + 4] = b"FILE"
+    struct.pack_into("<H", dec, RECORD_OFF + 0x14, attrs_off)
+    struct.pack_into("<H", dec, RECORD_OFF + 0x16, MFT_FLAG_DIR if e.is_dir else 0)
+    struct.pack_into("<I", dec, attr_count_pos, 0 if e.is_dir else 1)
+    if not e.is_dir:
+        struct.pack_into("<I", dec, attr_pos, ATTR_DATA)
+        dec[attr_pos + 8] = 1
+        struct.pack_into("<Q", dec, attr_pos + 0x30, e.size)
+        struct.pack_into("<Q", dec, attr_pos + 0x38, e.size)
+    return bytes(dec)
+
+
+def _write_blob(out: BinaryIO, e: CreateEntry) -> None:
+    meta = _make_metadata(e)
+    comp = zlib.compress(meta, level=6)
+    out.write(struct.pack("<II B II I", e.recno & 0xFFFFFFFF, 0, 1, len(meta), len(meta), len(comp)))
+    out.write(comp)
+    if e.is_dir or e.source is None:
+        return
+    with e.source.open("rb") as fh:
+        while True:
+            chunk = fh.read(WRITE_CHUNK)
+            if not chunk:
+                break
+            c = zlib.compress(chunk, level=6)
+            if len(c) >= len(chunk):
+                c = chunk
+            out.write(struct.pack("<II", len(chunk), len(c)))
+            out.write(c)
+
+
+def create_pmf_image(
+    out_path: Path,
+    sources: list[Path],
+    image_name: str = "",
+    overwrite: bool = False,
+    progress=None,
+) -> tuple[int, int, int]:
+    out_path = Path(out_path)
+    sources = [Path(p) for p in sources]
+    if out_path.exists() and not overwrite:
+        raise PmfError(f"output already exists: {out_path}")
+    entries = _build_create_entries(sources)
+    files = sum(1 for e in entries if not e.is_dir)
+    total = sum(e.size for e in entries if not e.is_dir)
+    catalog_bytes = max(len(entries) * ENTRY_SIZE, ENTRY_SIZE)
+    first_blob = CATALOG_START + ((catalog_bytes + 15) // 16) * 16
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("wb") as out:
+        out.write(_make_header(out_path, image_name))
+        out.seek(first_blob)
+        for i, e in enumerate(entries, 1):
+            e.blob = out.tell()
+            _write_blob(out, e)
+            if progress and (i == len(entries) or i % 100 == 0):
+                progress(i, len(entries), e)
+        out.seek(CATALOG_START)
+        for e in entries:
+            row = bytearray(ENTRY_SIZE)
+            struct.pack_into("<Q", row, 0x00, e.recno)
+            struct.pack_into("<Q", row, 0x08, e.mtime)
+            struct.pack_into("<Q", row, 0x10, e.mtime)
+            struct.pack_into("<Q", row, 0x18, e.size)
+            struct.pack_into("<Q", row, 0x20, e.blob)
+            struct.pack_into("<Q", row, 0x2C, e.crtime)
+            struct.pack_into("<I", row, 0x34, e.recno & 0xFFFFFFFF)
+            out.write(row)
+    return files, len(entries) - files, total
+
+
 
 def fmt_entry(e: Entry, path: str = "") -> str:
     kind = "<DIR> " if e.is_dir else f"{e.size:>14,}"
@@ -726,6 +932,23 @@ def cmd_index(img: PmfImage, args) -> None:
     print(f"{len(img.entries):,} entries indexed")
 
 
+def cmd_create(args) -> None:
+    files, dirs, total = create_pmf_image(
+        args.image,
+        args.sources,
+        image_name=args.name or args.image.stem,
+        overwrite=args.force,
+        progress=None if args.quiet else lambda n, total_entries, e: print(
+            f"[create] {n:,}/{total_entries:,} entries", file=sys.stderr
+        ),
+    )
+    if not args.quiet:
+        print(
+            f"Created {args.image} with {files:,} file(s), {dirs:,} folder(s), "
+            f"{human(total)}"
+        )
+
+
 def main(argv: Optional[list[str]] = None) -> None:
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -734,7 +957,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             pass
     p = argparse.ArgumentParser(
         prog="pmfview",
-        description="Read-only file viewer/extractor for DiskGenius .pmf images",
+        description="File viewer/extractor/creator for DiskGenius .pmf images",
     )
     p.add_argument("image", type=Path, help="path to .pmf image")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -764,7 +987,16 @@ def main(argv: Optional[list[str]] = None) -> None:
     sp.add_argument("path")
     sp.add_argument("--max-bytes", type=int, default=None)
 
+    sp = sub.add_parser("create", help="create a PMF image from local files/folders")
+    sp.add_argument("sources", nargs="+", type=Path, help="local files/folders to include")
+    sp.add_argument("--name", default="", help="image name stored in the header")
+    sp.add_argument("--force", action="store_true", help="overwrite output image if it exists")
+    sp.add_argument("--quiet", action="store_true")
+
     args = p.parse_args(argv)
+    if args.cmd == "create":
+        cmd_create(args)
+        return
     img = PmfImage(args.image)
     {
         "info": cmd_info,
