@@ -20,6 +20,7 @@ python pmfview.py backup.pmf find "*.kdbx"
 python pmfview.py backup.pmf extract "Users\me\Documents" --out D:\restored
 python pmfview.py backup.pmf cat "Windows\System32\drivers\etc\hosts"
 python pmfview.py new-backup.pmf create "D:\Photos" "D:\Documents"
+python pmfview.py hot-backup.pmf create "C:\Work" --hot  # Windows VSS; run as administrator
 
 # GUI (tree browser + search + extract + create)
 python pmfview_gui.py backup.pmf
@@ -109,3 +110,5 @@ name + parent MFT reference (root is MFT #5) — `$I30` indexes are not needed.
 - Created images are written with the PMF metadata subset this tool needs for
   browsing and extraction; compatibility with DiskGenius restore workflows has
   not been validated.
+- Hot-image creation uses Windows Volume Shadow Copy, requires administrator
+  rights, and supports local Windows volumes rather than network shares.

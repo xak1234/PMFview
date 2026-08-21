@@ -318,7 +318,9 @@ class App:
     def create_dialog(self):
         CreateImageWindow(self.root, self.create_image)
 
-    def create_image(self, out_path: Path, sources: list[Path]):
+    def create_image(
+        self, out_path: Path, sources: list[Path], hot_image: bool = False
+    ):
         names = ", ".join(p.name for p in sources[:3])
         if len(sources) > 3:
             names += f", +{len(sources) - 3} more"
@@ -336,6 +338,7 @@ class App:
                     image_name=out_path.stem,
                     overwrite=True,
                     progress=progress,
+                    hot_image=hot_image,
                 )
                 self.q.put(("create_done", (out_path, files, dirs, total)))
             except Exception as e:
@@ -834,6 +837,14 @@ class CreateImageWindow(tk.Toplevel):
         name_entry = ttk.Entry(output, textvariable=self.image_name)
         name_entry.grid(row=1, column=1, sticky="ew", pady=4)
 
+        self.hot_image = tk.BooleanVar(value=os.name == "nt")
+        ttk.Checkbutton(
+            output,
+            text="Hot image (Volume Shadow Copy)",
+            variable=self.hot_image,
+            state="normal" if os.name == "nt" else "disabled",
+        ).grid(row=2, column=1, sticky="w", pady=(8, 2))
+
         footer = ttk.Frame(self, style="Toolbar.TFrame", padding=(16, 10))
         footer.pack(fill="x", side="bottom")
         self.feedback = ttk.Label(footer, text="", style="Toolbar.TLabel")
@@ -942,7 +953,7 @@ class CreateImageWindow(tk.Toplevel):
         sources = list(self.sources)
         self.grab_release()
         self.destroy()
-        self.create_callback(out_path, sources)
+        self.create_callback(out_path, sources, self.hot_image.get())
 
 
 class PreviewWindow(tk.Toplevel):

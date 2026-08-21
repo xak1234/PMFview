@@ -45,12 +45,15 @@ Reverse-engineered format (hash-verified against real backup images):
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fnmatch
 import io
+import json
 import os
 import pickle
 import gzip
 import platform
+import subprocess
 import struct
 import sys
 import time
@@ -628,7 +631,100 @@ def _make_header(out_path: Path, image_name: str) -> bytes:
     return bytes(h)
 
 
-def _build_create_entries(sources: list[Path]) -> list[CreateEntry]:
+def _run_vss_script(script: str) -> str:
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive",
+             "-ExecutionPolicy", "Bypass", "-Command", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except OSError as exc:
+        raise PmfError(f"could not start Volume Shadow Copy: {exc}") from exc
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip()
+        raise PmfError(
+            "hot image snapshot failed; run PMF Viewer as administrator"
+            + (f": {detail}" if detail else "")
+        )
+    return result.stdout.strip()
+
+
+def _create_volume_snapshot(volume: str) -> tuple[str, str]:
+    escaped = volume.replace("'", "''")
+    script = (
+        "$ErrorActionPreference='Stop';"
+        f"$r=Invoke-CimMethod -ClassName Win32_ShadowCopy -MethodName Create "
+        f"-Arguments @{{Volume='{escaped}';Context='ClientAccessible'}};"
+        "if($r.ReturnValue -ne 0){throw ('VSS returned '+$r.ReturnValue)};"
+        "$s=Get-CimInstance -ClassName Win32_ShadowCopy | "
+        "Where-Object {$_.ID -eq $r.ShadowID};"
+        "if(-not $s){throw 'VSS snapshot was not found after creation'};"
+        "[pscustomobject]@{Id=$s.ID;DeviceObject=$s.DeviceObject} | "
+        "ConvertTo-Json -Compress"
+    )
+    raw = _run_vss_script(script)
+    try:
+        data = json.loads(raw)
+        return str(data["Id"]), str(data["DeviceObject"])
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise PmfError(f"invalid response from Volume Shadow Copy: {raw}") from exc
+
+
+def _delete_volume_snapshot(snapshot_id: str) -> None:
+    escaped = snapshot_id.replace("'", "''")
+    script = (
+        "$ErrorActionPreference='SilentlyContinue';"
+        f"$id='{escaped}';"
+        "Get-CimInstance -ClassName Win32_ShadowCopy | "
+        "Where-Object {$_.ID -eq $id} | Remove-CimInstance"
+    )
+    try:
+        _run_vss_script(script)
+    except PmfError:
+        pass
+
+
+@contextlib.contextmanager
+def _hot_snapshot_sources(sources: list[Path]):
+    if os.name != "nt":
+        raise PmfError("hot image snapshots are currently supported only on Windows")
+
+    originals = [p.resolve() for p in sources]
+    volumes: dict[str, tuple[str, str]] = {}
+    try:
+        for source in originals:
+            drive = source.drive
+            if not drive or drive.startswith("\\"):
+                raise PmfError(
+                    f"hot image requires a local Windows volume: {source}"
+                )
+            volume = drive.rstrip("\\/") + "\\"
+            key = volume.lower()
+            if key not in volumes:
+                volumes[key] = _create_volume_snapshot(volume)
+
+        snapshot_sources: list[Path] = []
+        for source in originals:
+            volume = source.drive.rstrip("\\/") + "\\"
+            _snapshot_id, device = volumes[volume.lower()]
+            relative = os.path.relpath(source, volume)
+            snapshot_sources.append(
+                Path(device + "\\" + ("" if relative == "." else relative))
+            )
+        yield snapshot_sources
+    finally:
+        for snapshot_id, _device in volumes.values():
+            _delete_volume_snapshot(snapshot_id)
+
+
+def _build_create_entries(
+    sources: list[Path], top_names: Optional[list[str]] = None
+) -> list[CreateEntry]:
     entries: list[CreateEntry] = []
     path_recno: dict[Path, int] = {}
     root_names: set[str] = set()
@@ -655,11 +751,17 @@ def _build_create_entries(sources: list[Path]) -> list[CreateEntry]:
         path_recno[path] = recno
         return recno
 
-    for src in sources:
+    if top_names is not None and len(top_names) != len(sources):
+        raise ValueError("top_names must match sources")
+
+    for index, src in enumerate(sources):
         src = src.resolve()
         if not src.exists():
             raise PmfError(f"source not found: {src}")
-        top_name = _unique_name(src.name or src.drive.rstrip(":"), root_names)
+        requested_name = top_names[index] if top_names is not None else (
+            src.name or src.drive.rstrip(":")
+        )
+        top_name = _unique_name(requested_name, root_names)
         top_recno = add_entry(src, 5, top_name)
         if not src.is_dir():
             continue
@@ -734,37 +836,46 @@ def create_pmf_image(
     image_name: str = "",
     overwrite: bool = False,
     progress=None,
+    hot_image: bool = False,
 ) -> tuple[int, int, int]:
     out_path = Path(out_path)
     sources = [Path(p) for p in sources]
     if out_path.exists() and not overwrite:
         raise PmfError(f"output already exists: {out_path}")
-    entries = _build_create_entries(sources)
-    files = sum(1 for e in entries if not e.is_dir)
-    total = sum(e.size for e in entries if not e.is_dir)
-    catalog_bytes = max(len(entries) * ENTRY_SIZE, ENTRY_SIZE)
-    first_blob = CATALOG_START + ((catalog_bytes + 15) // 16) * 16
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("wb") as out:
-        out.write(_make_header(out_path, image_name))
-        out.seek(first_blob)
-        for i, e in enumerate(entries, 1):
-            e.blob = out.tell()
-            _write_blob(out, e)
-            if progress and (i == len(entries) or i % 100 == 0):
-                progress(i, len(entries), e)
-        out.seek(CATALOG_START)
-        for e in entries:
-            row = bytearray(ENTRY_SIZE)
-            struct.pack_into("<Q", row, 0x00, e.recno)
-            struct.pack_into("<Q", row, 0x08, e.mtime)
-            struct.pack_into("<Q", row, 0x10, e.mtime)
-            struct.pack_into("<Q", row, 0x18, e.size)
-            struct.pack_into("<Q", row, 0x20, e.blob)
-            struct.pack_into("<Q", row, 0x2C, e.crtime)
-            struct.pack_into("<I", row, 0x34, e.recno & 0xFFFFFFFF)
-            out.write(row)
-    return files, len(entries) - files, total
+
+    original_names = [p.resolve().name or p.resolve().drive.rstrip(":")
+                      for p in sources]
+    source_context = (
+        _hot_snapshot_sources(sources)
+        if hot_image else contextlib.nullcontext(sources)
+    )
+    with source_context as read_sources:
+        entries = _build_create_entries(read_sources, top_names=original_names)
+        files = sum(1 for e in entries if not e.is_dir)
+        total = sum(e.size for e in entries if not e.is_dir)
+        catalog_bytes = max(len(entries) * ENTRY_SIZE, ENTRY_SIZE)
+        first_blob = CATALOG_START + ((catalog_bytes + 15) // 16) * 16
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with out_path.open("wb") as out:
+            out.write(_make_header(out_path, image_name))
+            out.seek(first_blob)
+            for i, e in enumerate(entries, 1):
+                e.blob = out.tell()
+                _write_blob(out, e)
+                if progress and (i == len(entries) or i % 100 == 0):
+                    progress(i, len(entries), e)
+            out.seek(CATALOG_START)
+            for e in entries:
+                row = bytearray(ENTRY_SIZE)
+                struct.pack_into("<Q", row, 0x00, e.recno)
+                struct.pack_into("<Q", row, 0x08, e.mtime)
+                struct.pack_into("<Q", row, 0x10, e.mtime)
+                struct.pack_into("<Q", row, 0x18, e.size)
+                struct.pack_into("<Q", row, 0x20, e.blob)
+                struct.pack_into("<Q", row, 0x2C, e.crtime)
+                struct.pack_into("<I", row, 0x34, e.recno & 0xFFFFFFFF)
+                out.write(row)
+        return files, len(entries) - files, total
 
 
 
@@ -938,6 +1049,7 @@ def cmd_create(args) -> None:
         args.sources,
         image_name=args.name or args.image.stem,
         overwrite=args.force,
+        hot_image=args.hot,
         progress=None if args.quiet else lambda n, total_entries, e: print(
             f"[create] {n:,}/{total_entries:,} entries", file=sys.stderr
         ),
@@ -991,6 +1103,8 @@ def main(argv: Optional[list[str]] = None) -> None:
     sp.add_argument("sources", nargs="+", type=Path, help="local files/folders to include")
     sp.add_argument("--name", default="", help="image name stored in the header")
     sp.add_argument("--force", action="store_true", help="overwrite output image if it exists")
+    sp.add_argument("--hot", action="store_true",
+                    help="read from Windows Volume Shadow Copy snapshots")
     sp.add_argument("--quiet", action="store_true")
 
     args = p.parse_args(argv)
