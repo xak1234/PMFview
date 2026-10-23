@@ -47,7 +47,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fnmatch
-import io
+import hashlib
 import json
 import os
 import pickle
@@ -56,11 +56,16 @@ import platform
 import subprocess
 import struct
 import sys
+import tempfile
 import time
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Iterator, Optional
+
+if __name__ == '__main__':
+    # The journal module imports pmfview too; keep one set of classes/errors.
+    sys.modules['pmfview'] = sys.modules[__name__]
 
 MAGIC = b"VIMG"
 CATALOG_START = 0x10000
@@ -73,7 +78,7 @@ CHUNK_MAX = 0x10000000          # sanity cap for a single data chunk (256 MiB)
 WRITE_CHUNK = 1 << 20
 FT_MIN = 116444736000000000        # 1970-01-01
 FT_MAX = 159000000000000000        # ~2104
-INDEX_CACHE_VERSION = 3
+INDEX_CACHE_VERSION = 4
 
 ATTR_DATA = 0x80
 ATTR_END = 0xFFFFFFFF
@@ -109,7 +114,7 @@ def ft_str(ft: int) -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ft_to_unix(ft)))
 
 
-def human(n: int) -> str:
+def human(n: float) -> str:
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if n < 1024 or unit == "TB":
             return f"{n:,.0f} {unit}" if unit == "B" else f"{n:,.1f} {unit}"
@@ -191,22 +196,39 @@ class PmfError(Exception):
 
 
 class PmfImage:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, revision: Optional[int] = None):
+        self.requested_revision = revision
         self.path = Path(path)
         self.f: BinaryIO = self.path.open("rb")
-        self.file_size = self.path.stat().st_size
-        self.header = self._parse_header()
+        self.file_stat = os.fstat(self.f.fileno())
+        self.file_size = self.file_stat.st_size
+        try:
+            self.header = self._parse_header()
+        except BaseException:
+            self.f.close()
+            raise
         self.entries: dict[int, Entry] = {}
         self.children: dict[int, list[int]] = {}
         self.root_recno = 5
         self._loaded = False
+        self.index_errors = 0
+        self.index_issues: list[str] = []
+        self.file_hashes: dict[int, str] = {}
+        self.revisions: list[dict[str, object]] = []
+        self.revision = 0
+        self.committed_end = self.file_size
+        self.incremental_warning = ''
+
+    def close(self) -> None:
+        """Release the image handle."""
+        self.f.close()
 
     # ---------- header ----------
 
     def _parse_header(self) -> Header:
         self.f.seek(0)
         h = self.f.read(0x400)
-        if h[:4] != MAGIC:
+        if len(h) < 0x400 or h[:4] != MAGIC:
             raise PmfError(f"{self.path}: not a DiskGenius PMF/VIMG image")
         year = u16(h, 0x274)
         created = (
@@ -232,43 +254,55 @@ class PmfImage:
         if self._loaded and not rebuild:
             return
         cache = self._cache_path()
-        st = self.path.stat()
+        st = self.file_stat
+        loaded = False
+        from pmf_repair import index_issues
         if not rebuild and cache.exists():
             try:
                 with gzip.open(cache, "rb") as fh:
                     payload = pickle.load(fh)
-                if (
-                    payload.get("version") == INDEX_CACHE_VERSION
-                    and payload.get("size") == st.st_size
-                    and payload.get("mtime") == st.st_mtime_ns
-                ):
+                if (payload.get("version") == INDEX_CACHE_VERSION
+                        and payload.get("size") == st.st_size
+                        and payload.get("mtime") == st.st_mtime_ns):
                     self.entries = payload["entries"]
+                    self.index_errors = payload["index_errors"]
                     self._finish_index()
-                    if progress:
-                        print(
-                            f"[index] loaded {len(self.entries):,} entries from cache",
-                            file=sys.stderr,
-                        )
-                    return
+                    loaded = not index_issues(self.entries)
             except Exception:
                 pass
-        self._build_index(progress=progress)
+        if not loaded:
+            self._build_index(progress=progress)
+            try:
+                self._save_index_cache(self.entries)
+            except OSError as e:
+                if progress:
+                    print(f"[index] could not write cache: {e}", file=sys.stderr)
+        from pmf_update import apply_updates
         try:
-            with gzip.open(cache, "wb", compresslevel=1) as fh:
-                pickle.dump(
-                    {
-                        "version": INDEX_CACHE_VERSION,
-                        "size": st.st_size,
-                        "mtime": st.st_mtime_ns,
-                        "entries": self.entries,
-                    },
-                    fh,
-                    protocol=pickle.HIGHEST_PROTOCOL,
-                )
-            if progress:
-                print(f"[index] cached to {cache.name}", file=sys.stderr)
-        except OSError as e:
-            print(f"[index] warning: could not write cache: {e}", file=sys.stderr)
+            apply_updates(self)
+            self.index_issues = index_issues(self.entries)
+        except BaseException:
+            self._loaded = False
+            raise
+        if self.index_errors or self.index_issues:
+            print(f"[index] Metadata issues: {self.index_errors} unreadable records; "
+                  f"{len(self.index_issues)} tree issues. Writes are disabled; use repair-mft.", file=sys.stderr)
+        if self.incremental_warning:
+            print(f"[index] WARNING: {self.incremental_warning}", file=sys.stderr)
+
+    def _save_index_cache(self, entries: dict[int, Entry]) -> None:
+        cache = self._cache_path()
+        fd, temporary = tempfile.mkstemp(prefix='.pmf-index-', dir=cache.parent)
+        try:
+            with os.fdopen(fd, 'wb') as raw:
+                with gzip.GzipFile(fileobj=raw, mode='wb', compresslevel=1) as fh:
+                    pickle.dump({"version": INDEX_CACHE_VERSION,
+                                 "size": self.file_stat.st_size, "mtime": self.file_stat.st_mtime_ns,
+                                 "entries": entries, "index_errors": self.index_errors},
+                                fh, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(temporary, cache)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
 
     def _catalog_end(self) -> int:
         """Catalog runs from CATALOG_START to the first blob (blobs are laid
@@ -336,7 +370,6 @@ class PmfImage:
                 file=sys.stderr,
             )
         entries: dict[int, Entry] = {}
-        f = self.f
         t0 = time.time()
         n_bad = 0
         for n, (blob, recno, size, crtime, mtime) in enumerate(cat):
@@ -369,6 +402,7 @@ class PmfImage:
                 )
         if n_bad:
             print(f"[index] {n_bad} unreadable streams skipped", file=sys.stderr)
+        self.index_errors = n_bad + (not entries)
         self.entries = entries
         self._finish_index()
         if progress:
@@ -378,6 +412,8 @@ class PmfImage:
             )
 
     def _finish_index(self) -> None:
+        self.entries.setdefault(self.root_recno,
+            Entry(self.root_recno, 0, '', 0, FILE_ATTR_DIRECTORY, 0, 0, 0))
         children: dict[int, list[int]] = {}
         for e in self.entries.values():
             if e.recno == self.root_recno:
@@ -473,6 +509,24 @@ class PmfImage:
     # ---------- data extraction ----------
 
     def iter_file_data(self, entry: Entry) -> Iterator[bytes]:
+        """Yield content; a complete read verifies any incremental SHA-256 checksum.
+
+        A caller stopping early receives a preview, not a full integrity check.
+        """
+        expected = self.file_hashes.get(entry.recno)
+        digest = hashlib.sha256() if expected else None
+        count = 0
+        for chunk in self._iter_file_data_unchecked(entry):
+            count += len(chunk)
+            if digest is not None:
+                digest.update(chunk)
+            yield chunk
+        if count != entry.size:
+            raise PmfError(f'Incomplete file data: {entry.name}')
+        if digest is not None and digest.hexdigest() != expected:
+            raise PmfError(f'Incremental file checksum failed: {entry.name}')
+
+    def _iter_file_data_unchecked(self, entry: Entry) -> Iterator[bytes]:
         """Yield the file's content in chunks."""
         if entry.size == 0:
             return
@@ -537,7 +591,7 @@ class PmfImage:
         out = bytearray()
         for chunk in self.iter_file_data(entry):
             out += chunk
-            if max_bytes is not None and len(out) >= max_bytes:
+            if max_bytes is not None and max_bytes < entry.size and len(out) >= max_bytes:
                 return bytes(out[:max_bytes])
         return bytes(out)
 
@@ -579,8 +633,12 @@ class PmfImage:
     def walk(self, recno: int) -> Iterator[int]:
         """Yield recnos of all descendants (depth-first), including recno itself."""
         stack = [recno]
+        seen: set[int] = set()
         while stack:
             r = stack.pop()
+            if r in seen:
+                continue
+            seen.add(r)
             yield r
             stack.extend(reversed(self.children.get(r, [])))
 
@@ -762,7 +820,7 @@ def _build_create_entries(
             src.name or src.drive.rstrip(":")
         )
         top_name = _unique_name(requested_name, root_names)
-        top_recno = add_entry(src, 5, top_name)
+        add_entry(src, 5, top_name)
         if not src.is_dir():
             continue
         for dirpath, dirnames, filenames in os.walk(src):
@@ -887,7 +945,7 @@ def fmt_entry(e: Entry, path: str = "") -> str:
 def cmd_info(img: PmfImage, args) -> None:
     h = img.header
     print(f"Image:       {h.path}")
-    print(f"Format:      DiskGenius PMF (VIMG), Backup-All-Files mode")
+    print("Format:      DiskGenius PMF (VIMG), Backup-All-Files mode")
     print(f"Image size:  {h.file_size:,} bytes ({human(h.file_size)})")
     print(f"Filesystem:  {h.filesystem}")
     print(f"Disk model:  {h.disk_model}")
@@ -900,6 +958,14 @@ def cmd_info(img: PmfImage, args) -> None:
     total = sum(e.size for e in img.entries.values() if not e.is_dir)
     print(f"Entries:     {len(img.entries):,} ({files:,} files, {dirs:,} dirs)")
     print(f"Total data:  {total:,} bytes ({human(total)})")
+    print(f"Revision:    {img.revision}")
+
+
+def cmd_history(img: PmfImage, args) -> None:
+    img.load_index()
+    for row in img.revisions or [{"revision": 0, "created": img.header.created,
+                                 "summary": "Original image"}]:
+        print(f"{row['revision']}: {row['created']}  {row['summary']}")
 
 
 def cmd_ls(img: PmfImage, args) -> None:
@@ -964,21 +1030,57 @@ def _safe_rel(path: str) -> Path:
     return Path(*clean) if clean else Path("_")
 
 
-def _extract_one(img: PmfImage, e: Entry, target: Path, quiet: bool = False) -> bool:
+def extraction_target(out_dir: Path, relative: str) -> Path:
+    """Keep extraction inside its chosen destination, including through symlinks."""
+    root = out_dir.resolve()
+    dest = root / _safe_rel(relative.replace('/', '\\')) if relative.strip('\\/') else root
+    if not dest.resolve().is_relative_to(root):
+        raise PmfError(f'Extraction path escapes destination: {relative}')
+    return dest
+
+
+def _extended_path(path: Path) -> Path:
+    if os.name != 'nt':
+        return path
+    text = os.path.abspath(path)
+    prefix = "\\\\?\\"
+    if text.startswith(prefix):
+        return Path(text)
+    if text.startswith("\\\\"):
+        return Path(prefix + "UNC\\" + text[2:])
+    return Path(prefix + text)
+
+
+def make_extraction_directory(path: Path) -> None:
+    _extended_path(path).mkdir(parents=True, exist_ok=True)
+
+
+def extract_file(img: PmfImage, entry: Entry, target: Path) -> None:
+    """Publish extracted bytes only after a complete read/checksum succeeds."""
+    protected = (img.path, img._cache_path(), img.path.with_name(img.path.name + '.update.lock'))
+    if target.resolve() in {p.resolve() for p in protected}:
+        raise PmfError('Extraction would overwrite the source image or its state files')
+    target = _extended_path(target)
     target.parent.mkdir(parents=True, exist_ok=True)
-    tgt = target
-    if os.name == "nt" and len(str(tgt)) > 250 and not str(tgt).startswith("\\\\?\\"):
-        tgt = Path("\\\\?\\" + os.path.abspath(str(tgt)))
+    fd, temporary = tempfile.mkstemp(prefix='.pmf-extract-', dir=target.parent)
     try:
-        with open(tgt, "wb") as out:
-            for chunk in img.iter_file_data(e):
+        with os.fdopen(fd, 'wb') as out:
+            for chunk in img.iter_file_data(entry):
                 out.write(chunk)
-        try:
-            ts = ft_to_unix(e.mtime)
-            if ts > 0:
-                os.utime(tgt, (ts, ts))
-        except (OSError, OverflowError):
-            pass
+        ts = ft_to_unix(entry.mtime)
+        if ts > 0:
+            try:
+                os.utime(temporary, (ts, ts))
+            except (OSError, OverflowError):
+                pass
+        os.replace(temporary, target)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def _extract_one(img: PmfImage, e: Entry, target: Path, quiet: bool = False) -> bool:
+    try:
+        extract_file(img, e, target)
         if not quiet:
             print(f"  {img.full_path(e.recno)}  ({human(e.size)})")
         return True
@@ -1007,7 +1109,7 @@ def cmd_extract(img: PmfImage, args) -> None:
             raise SystemExit(f"path not found: {spec}")
         targets.extend(matched)
 
-    ok = fail = skip = 0
+    ok = fail = 0
     for recno in targets:
         base_e = img.entries.get(recno)
         base_parent_path = img.full_path(base_e.parent) if base_e else ""
@@ -1015,9 +1117,9 @@ def cmd_extract(img: PmfImage, args) -> None:
             e = img.entries[r]
             full = img.full_path(r)
             rel = full[len(base_parent_path):].lstrip("\\") if base_parent_path and full.startswith(base_parent_path) else full
-            dest = out_dir / _safe_rel(rel)
+            dest = extraction_target(out_dir, rel)
             if e.is_dir:
-                dest.mkdir(parents=True, exist_ok=True)
+                make_extraction_directory(dest)
                 continue
             if _extract_one(img, e, dest, quiet=args.quiet):
                 ok += 1
@@ -1061,10 +1163,71 @@ def cmd_create(args) -> None:
         )
 
 
+def cmd_update(args) -> None:
+    from pmf_update import PmfError as UpdateError, update_pmf_image
+
+    try:
+        result = update_pmf_image(
+            args.image, args.sources, hot_image=args.hot, image_root=args.image_root,
+            dry_run=args.dry_run, delete_missing=not args.keep_missing,
+            expected_revision=args.expected_revision,
+            progress=None if args.quiet else lambda text: print(text, file=sys.stderr),
+        )
+    except (UpdateError, OSError) as exc:
+        raise SystemExit(f"Update cancelled: {exc}") from exc
+    print(f"{'Preview' if result.dry_run else 'Updated'}: {result.added} added, "
+          f"{result.changed} changed, {result.deleted} deleted, {result.unchanged} unchanged")
+    print(f"Revision {result.revision}; appended {result.written:,} bytes")
+    if result.dry_run:
+        print("No image data was changed.")
+
+
+def cmd_stat(img: PmfImage, args) -> None:
+    img.load_index()
+    recno = img.resolve(args.path)
+    if recno is None:
+        raise PmfError(f'Path not found: {args.path}')
+    e = img.entries[recno]
+    print(json.dumps({'path': img.full_path(recno), 'directory': e.is_dir,
+        'size': e.size, 'created': ft_str(e.crtime), 'modified': ft_str(e.mtime),
+        'record': recno, 'parent': e.parent, 'blob': e.blob, 'revision': img.revision}, indent=2))
+
+
+def cmd_hash(img: PmfImage, args) -> None:
+    img.load_index()
+    recno = img.resolve(args.path)
+    if recno is None or img.entries[recno].is_dir:
+        raise PmfError(f'File not found: {args.path}')
+    digest = hashlib.new(args.algorithm)
+    for chunk in img.iter_file_data(img.entries[recno]):
+        digest.update(chunk)
+    print(f'{args.algorithm}({img.full_path(recno)}) = {digest.hexdigest()}')
+
+
+def cmd_read(img: PmfImage, args) -> None:
+    img.load_index()
+    if args.offset < 0 or args.length <= 0:
+        raise PmfError('offset must be nonnegative and length must be positive')
+    recno = img.resolve(args.path)
+    if recno is None or img.entries[recno].is_dir:
+        raise PmfError(f'File not found: {args.path}')
+    entry = img.entries[recno]
+    pos, end = 0, args.offset + args.length
+    for chunk in img.iter_file_data(entry):
+        following = pos + len(chunk)
+        if following > args.offset:
+            sys.stdout.buffer.write(chunk[max(0, args.offset-pos):max(0, end-pos)])
+        pos = following
+        if pos >= end and end < entry.size:
+            break
+
+
 def main(argv: Optional[list[str]] = None) -> None:
     for stream in (sys.stdout, sys.stderr):
         try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
+            reconfigure = getattr(stream, "reconfigure", None)
+            if reconfigure is not None:
+                reconfigure(encoding="utf-8", errors="replace")
         except (AttributeError, OSError):
             pass
     p = argparse.ArgumentParser(
@@ -1072,9 +1235,41 @@ def main(argv: Optional[list[str]] = None) -> None:
         description="File viewer/extractor/creator for DiskGenius .pmf images",
     )
     p.add_argument("image", type=Path, help="path to .pmf image")
+    p.add_argument("--revision", type=int, help="read an older revision (0 = original)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("info", help="image summary")
+    sub.add_parser("history", help="list committed revisions")
+    sp = sub.add_parser('repair-mft', help='check/rebuild MFT-derived PMF index; no NTFS volume repair')
+    sp.add_argument('--apply', action='store_true', help='rebuild the cache if metadata validates')
+    sp = sub.add_parser('stat', help='file/directory metadata')
+    sp.add_argument('path')
+    sp = sub.add_parser('hash', help='hash and verify an entire file')
+    sp.add_argument('path')
+    sp.add_argument('--algorithm', choices=('sha256', 'sha1', 'md5'), default='sha256')
+    sp = sub.add_parser('read', help='read a byte range to stdout; use cat for the whole file')
+    sp.add_argument('path')
+    sp.add_argument('--offset', type=int, default=0)
+    sp.add_argument('--length', type=int, default=16384)
+    sp = sub.add_parser('write', help='create/replace complete text or base64 file contents')
+    sp.add_argument('path', help='target path in image; parent folder must exist')
+    sp.add_argument('content', help='complete UTF-8 text, or base64 with --encoding base64')
+    sp.add_argument('--encoding', choices=('utf-8', 'base64'), default='utf-8')
+    sp.add_argument('--expected-revision', type=int)
+    sp = sub.add_parser('import', help='create/replace an image file from a local file')
+    sp.add_argument('source', type=Path)
+    sp.add_argument('path', help='target path in image; parent folder must exist')
+    sp.add_argument('--expected-revision', type=int)
+
+    sp = sub.add_parser('mount', help='mount as a Windows drive (optional WinFsp dependency)')
+    sp.add_argument('drive', help='unused drive letter, e.g. P:')
+    sp.add_argument('--read-write', action='store_true', help='enable saves into append-only PMF revisions')
+    sp = sub.add_parser('mount-status', help='show mounts for this image')
+    sp.add_argument('drive', nargs='?')
+    for command, help_text in (('flush-mount', 'commit pending mount writes'),
+                                ('unmount', 'flush and remove a mounted drive')):
+        sp = sub.add_parser(command, help=help_text)
+        sp.add_argument('drive')
 
     sp = sub.add_parser("index", help="build or refresh the file index cache")
     sp.add_argument("--rebuild", action="store_true")
@@ -1107,21 +1302,78 @@ def main(argv: Optional[list[str]] = None) -> None:
                     help="read from Windows Volume Shadow Copy snapshots")
     sp.add_argument("--quiet", action="store_true")
 
+    sp = sub.add_parser("update", help="append an incremental revision to an existing PMF")
+    sp.add_argument("sources", nargs="+", type=Path, help="live folders matching folders inside the image")
+    sp.add_argument("--image-root", action="store_true",
+                    help="map the contents of one source folder/drive to the image root")
+    sp.add_argument("--hot", action="store_true", help="read a Windows VSS snapshot (administrator)")
+    sp.add_argument("--dry-run", action="store_true", help="compare and report without writing image data")
+    sp.add_argument("--keep-missing", action="store_true", help="retain files missing from source")
+    sp.add_argument("--expected-revision", type=int)
+    sp.add_argument("--quiet", action="store_true")
+
     args = p.parse_args(argv)
+    if args.revision is not None and args.cmd in ("update", "create", "write", "import", "repair-mft"):
+        p.error("--revision applies only to reading existing images")
+    if args.cmd in ('mount', 'mount-status', 'flush-mount', 'unmount'):
+        from pmf_mount import control_mount, list_mounts, start_mount
+        if args.cmd == 'mount':
+            mount_result: object = start_mount(args.image, args.drive, read_only=not args.read_write,
+                                       revision=args.revision)
+        elif args.cmd == 'mount-status':
+            mount_result = (control_mount(args.drive, 'status', image_path=args.image)
+                            if args.drive else list_mounts(args.image))
+        else:
+            mount_result = control_mount(args.drive, 'flush' if args.cmd == 'flush-mount' else 'unmount',
+                                         image_path=args.image)
+        print(json.dumps(mount_result, indent=2))
+        return
+    if args.cmd == 'repair-mft':
+        from pmf_repair import repair_mft_index
+        result = repair_mft_index(args.image, repair=args.apply)
+        print(json.dumps(result, indent=2))
+        if result['status'] == 'needs_recovery':
+            raise SystemExit(2)
+        return
+    if args.cmd in ('write', 'import'):
+        from pmf_update import put_pmf_file, write_pmf_file
+        if args.cmd == 'write':
+            written = write_pmf_file(args.image, args.path, args.content, encoding=args.encoding,
+                                     expected_revision=args.expected_revision)
+        else:
+            written = put_pmf_file(args.image, args.path, args.source,
+                                   expected_revision=args.expected_revision)
+        print(f'Revision {written.revision}: {written.added} added, {written.changed} changed; '
+              f'{written.written:,} bytes appended')
+        return
+    if args.cmd == "update":
+        cmd_update(args)
+        return
     if args.cmd == "create":
         cmd_create(args)
         return
-    img = PmfImage(args.image)
-    {
-        "info": cmd_info,
-        "index": cmd_index,
-        "ls": cmd_ls,
-        "tree": cmd_tree,
-        "find": cmd_find,
-        "extract": cmd_extract,
-        "cat": cmd_cat,
-    }[args.cmd](img, args)
+    img = PmfImage(args.image, revision=args.revision)
+    try:
+        {
+            "info": cmd_info,
+            "history": cmd_history,
+            "stat": cmd_stat,
+            "hash": cmd_hash,
+            "read": cmd_read,
+            "index": cmd_index,
+            "ls": cmd_ls,
+            "tree": cmd_tree,
+            "find": cmd_find,
+            "extract": cmd_extract,
+            "cat": cmd_cat,
+        }[args.cmd](img, args)
+    finally:
+        img.close()
 
 
 if __name__ == "__main__":
-    main()
+    Entry.__module__ = 'pmfview'
+    try:
+        main()
+    except (PmfError, OSError) as exc:
+        raise SystemExit(str(exc)) from exc

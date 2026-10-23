@@ -19,11 +19,11 @@ import queue
 import sys
 import threading
 import tkinter as tk
-import tkinter.font as tkfont
 from pathlib import Path
-from tkinter import filedialog, ttk
+from tkinter import filedialog, messagebox, ttk
 
-from pmfview import Entry, PmfError, PmfImage, create_pmf_image, ft_str, ft_to_unix, human, _safe_rel
+from pmf_update import update_pmf_image
+from pmfview import Entry, PmfError, PmfImage, create_pmf_image, ft_str, human, extract_file, extraction_target, make_extraction_directory
 
 # ---------------------------------------------------------------- theme ----
 
@@ -206,6 +206,23 @@ class App:
         ttk.Label(bar, text="name or glob — Enter to search, Esc to clear",
                   style="Toolbar.TLabel").pack(side="right", padx=(0, 10))
 
+        revisions = ttk.Frame(self.root, style="Toolbar.TFrame", padding=(10, 0, 10, 8))
+        revisions.pack(fill="x")
+        self.btn_update = ttk.Button(revisions, text="Incremental Update…",
+                                     command=self.update_dialog, state="disabled")
+        self.btn_update.pack(side="left")
+        self.btn_versions = ttk.Button(revisions, text="Versions…",
+                                       command=self.versions_dialog, state="disabled")
+        self.btn_versions.pack(side="left", padx=(8, 0))
+        self.btn_refresh = ttk.Button(revisions, text="Refresh Latest",
+                                      command=self.refresh_latest, state="disabled")
+        self.btn_refresh.pack(side="left", padx=(8, 0))
+        self.btn_mount = ttk.Button(revisions, text="Mount Image…",
+                                    command=self.mount_dialog, state="disabled")
+        self.btn_mount.pack(side="left", padx=(8, 0))
+        ttk.Label(revisions, text="Updates stay in this PMF; earlier versions remain readable.",
+                  style="Toolbar.TLabel").pack(side="left", padx=16)
+
     def _build_body(self):
         crumb_row = ttk.Frame(self.root, padding=(12, 8, 12, 4))
         crumb_row.pack(fill="x")
@@ -301,14 +318,26 @@ class App:
         else:
             self.pbar.stop()
             self.pbar.pack_forget()
-        for b in (self.btn_open, self.btn_create, self.btn_extract):
+        for b in (self.btn_open, self.btn_create, self.btn_extract, self.btn_update, self.btn_versions, self.btn_refresh, self.btn_mount):
             b.state(["disabled"] if busy else ["!disabled"])
+        if not busy and self.img is not None and (self.img.requested_revision is not None
+                or self.img.index_errors or self.img.index_issues or self.img.incremental_warning):
+            self.btn_update.state(["disabled"])
         if not busy and self.img is None:
-            self.btn_extract.state(["disabled"])
+            for b in (self.btn_extract, self.btn_update, self.btn_versions, self.btn_refresh, self.btn_mount):
+                b.state(["disabled"])
 
     # ------------------------------------------------------------ loading
 
+    def mount_dialog(self):
+        if self._busy or self.img is None:
+            return
+        from pmf_mount_gui import MountWindow
+        MountWindow(self.root, self.img.path, self.img.requested_revision)
+
     def open_dialog(self):
+        if self._busy:
+            return
         p = filedialog.askopenfilename(
             title="Open DiskGenius image",
             filetypes=[("PMF images", "*.pmf"), ("All files", "*.*")])
@@ -316,7 +345,59 @@ class App:
             self.open_image(Path(p))
 
     def create_dialog(self):
+        if self._busy:
+            return
         CreateImageWindow(self.root, self.create_image)
+
+    def update_dialog(self):
+        if self._busy or self.img is None:
+            return
+        CreateImageWindow(self.root, self.update_image, image_path=self.img.path)
+
+    def update_image(self, path: Path, sources: list[Path], hot_image: bool = False,
+                     image_root: bool = False, preview: bool = False, delete_missing: bool = True):
+        if self._busy:
+            return
+        self._set_busy(True, "Comparing source folders…")
+        def work():
+            try:
+                result = update_pmf_image(path, sources, hot_image=hot_image,
+                    image_root=image_root, dry_run=preview, delete_missing=delete_missing,
+                    progress=lambda text: self.q.put(("status", text)))
+                self.q.put(("update_done", (path, result)))
+            except Exception as exc:
+                self.q.put(("error", f"Update cancelled: {exc}"))
+        threading.Thread(target=work, daemon=True).start()
+
+    def refresh_latest(self):
+        if not self._busy and self.img is not None:
+            self.open_image(self.img.path)
+
+    def versions_dialog(self):
+        if self._busy or self.img is None:
+            return
+        img = self.img
+        window = tk.Toplevel(self.root, bg=BG)
+        window.title("PMF Versions")
+        window.geometry("780x360")
+        window.transient(self.root)
+        apply_dark_titlebar(window)
+        listing = tk.Listbox(window, bg=PANEL, fg=FG, selectbackground=SEL_BG,
+                             font=("Segoe UI", 10))
+        listing.pack(fill="both", expand=True, padx=12, pady=12)
+        rows = img.revisions or [{"revision": 0, "created": img.header.created,
+                                 "summary": "Original image"}]
+        for row in rows:
+            listing.insert("end", f"{row['revision']}   {row['created']}   {row['summary']}")
+        listing.selection_set(min(img.revision, len(rows) - 1))
+        def choose():
+            selected = listing.curselection()
+            if selected:
+                revision = int(rows[selected[0]]["revision"])
+                window.destroy()
+                self.open_image(img.path, revision=revision)
+        ttk.Button(window, text="Open Selected Version", command=choose).pack(pady=(0, 12))
+        listing.bind("<Double-1>", lambda _event: choose())
 
     def create_image(
         self, out_path: Path, sources: list[Path], hot_image: bool = False
@@ -346,16 +427,21 @@ class App:
 
         threading.Thread(target=work, daemon=True).start()
 
-    def open_image(self, path: Path):
+    def open_image(self, path: Path, revision: int | None = None):
+        if self._busy:
+            return
         self._set_busy(True, f"Opening {path.name} — building index "
                              f"(first time can take a minute)…")
 
         def work():
+            img = None
             try:
-                img = PmfImage(path)
+                img = PmfImage(path, revision=revision)
                 img.load_index(progress=False)
                 self.q.put(("loaded", img))
             except Exception as e:
+                if img is not None:
+                    img.close()
                 self.q.put(("error", f"Could not open image:\n{e}"))
 
         threading.Thread(target=work, daemon=True).start()
@@ -366,6 +452,8 @@ class App:
                 kind, payload = self.q.get_nowait()
                 if kind == "loaded":
                     self._set_busy(False)
+                    if self.img is not None:
+                        self.img.close()
                     self.img = payload
                     self._after_load()
                 elif kind == "error":
@@ -391,6 +479,16 @@ class App:
                            f"{dirs:,} folders, {human(total)}")
                     self.status_l.configure(text=msg, foreground=OK_GREEN)
                     self.open_image(out_path)
+                elif kind == "update_done":
+                    self._set_busy(False)
+                    path, result = payload
+                    text = (f"{result.added} added, {result.changed} changed, "
+                            f"{result.deleted} deleted, {result.unchanged} unchanged.\n"
+                            f"Revision {result.revision}; appended {human(result.written)}.")
+                    messagebox.showinfo("Update Preview" if result.dry_run else "Incremental Update", text,
+                                        parent=self.root)
+                    if not result.dry_run:
+                        self.open_image(path)
                 elif kind == "hash_done":
                     self._set_busy(False)
                     name, digest = payload
@@ -408,12 +506,19 @@ class App:
         img = self.img
         files = sum(1 for e in img.entries.values() if not e.is_dir)
         total = sum(e.size for e in img.entries.values() if not e.is_dir)
-        self.root.title(f"PMF Viewer — {img.path.name}")
+        self.root.title(f"PMF Viewer — {img.path.name} — revision {img.revision}")
         self.status_l.configure(
             text=f"{img.path.name}   ·   {files:,} files, "
                  f"{len(img.entries)-files:,} folders   ·   {human(total)}   ·   "
-                 f"created {img.header.created}   ·   {img.header.disk_model.strip()}")
-        self.btn_extract.state(["!disabled"])
+                 f"revision {img.revision}   ·   {img.incremental_warning or img.header.disk_model.strip()}")
+        for button in (self.btn_extract, self.btn_update, self.btn_versions, self.btn_refresh, self.btn_mount):
+            button.state(["!disabled"])
+        self.btn_update.state(["disabled"] if img.requested_revision is not None else ["!disabled"])
+        if img.incremental_warning or img.index_errors or img.index_issues:
+            self.btn_update.state(["disabled"])
+            self.status_l.configure(foreground=WARN_RED,
+                text=f"{img.path.name} · revision {img.revision} · "
+                     f"{img.incremental_warning or 'Metadata needs recovery; use CLI repair-mft for a report.'}")
         self.btn_up.state(["!disabled"])
         self.history.clear()
         self.search_results = None
@@ -597,6 +702,8 @@ class App:
     # ------------------------------------------------------------ search
 
     def do_search(self):
+        if self._busy:
+            return
         if self.img is None:
             return
         pat = self.search_var.get().strip().lower()
@@ -650,6 +757,8 @@ class App:
             self.status_l.configure(text=f"Copied {len(recnos)} path(s) to clipboard")
 
     def hash_selected(self):
+        if self._busy:
+            return
         recnos = self._selected_recnos()
         if not recnos:
             return
@@ -672,6 +781,8 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def preview_selected(self):
+        if self._busy:
+            return
         recnos = self._selected_recnos()
         if not recnos:
             return
@@ -688,6 +799,8 @@ class App:
         PreviewWindow(self.root, self.img.full_path(e.recno), e, data)
 
     def extract_selected(self):
+        if self._busy:
+            return
         if self.img is None:
             return
         recnos = self._selected_recnos()
@@ -704,43 +817,34 @@ class App:
         self._set_busy(True, "Extracting…")
 
         def work():
-            img = self.img
-            ok = fail = 0
-            for recno in recnos:
-                base_e = img.entries.get(recno)
-                if base_e is None:
-                    continue
-                base_parent = (img.full_path(base_e.parent)
-                               if base_e.parent in img.entries else "")
-                for r in img.walk(recno):
-                    e = img.entries[r]
-                    full = img.full_path(r)
-                    rel = (full[len(base_parent):].lstrip("\\")
-                           if base_parent and full.startswith(base_parent) else full)
-                    dest = out_dir / _safe_rel(rel)
-                    if e.is_dir:
-                        dest.mkdir(parents=True, exist_ok=True)
+            try:
+                img = self.img
+                ok = fail = 0
+                for recno in recnos:
+                    base_e = img.entries.get(recno)
+                    if base_e is None:
                         continue
-                    try:
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        tgt = dest
-                        if os.name == "nt" and len(str(tgt)) > 250:
-                            tgt = Path("\\\\?\\" + os.path.abspath(str(tgt)))
-                        with open(tgt, "wb") as fh:
-                            for chunk in img.iter_file_data(e):
-                                fh.write(chunk)
+                    base_parent = (img.full_path(base_e.parent)
+                                   if base_e.parent in img.entries else "")
+                    for r in img.walk(recno):
+                        e = img.entries[r]
+                        full = img.full_path(r)
+                        rel = (full[len(base_parent):].lstrip("\\")
+                               if base_parent and full.startswith(base_parent) else full)
+                        dest = extraction_target(out_dir, rel)
+                        if e.is_dir:
+                            make_extraction_directory(dest)
+                            continue
                         try:
-                            ts = ft_to_unix(e.mtime)
-                            if ts > 0:
-                                os.utime(tgt, (ts, ts))
-                        except (OSError, OverflowError):
-                            pass
-                        ok += 1
-                        if ok % 200 == 0:
-                            self.q.put(("status", f"Extracting… {ok:,} files"))
-                    except (PmfError, OSError):
-                        fail += 1
-            self.q.put(("extract_done", (ok, fail, str(out_dir))))
+                            extract_file(img, e, dest)
+                            ok += 1
+                            if ok % 200 == 0:
+                                self.q.put(("status", f"Extracting… {ok:,} files"))
+                        except (PmfError, OSError):
+                            fail += 1
+                self.q.put(("extract_done", (ok, fail, str(out_dir))))
+            except Exception as exc:
+                self.q.put(("error", f"Extraction failed: {exc}"))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -748,14 +852,16 @@ class App:
 class CreateImageWindow(tk.Toplevel):
     """Application-owned folder picker for building a PMF image."""
 
-    def __init__(self, master: tk.Misc, create_callback):
+    def __init__(self, master: tk.Misc, create_callback, image_path: Path | None = None):
         super().__init__(master, bg=BG)
         self.create_callback = create_callback
+        self.image_path = image_path
+        title = "Incremental Update" if image_path else "Create PMF Image"
         self.sources: list[Path] = []
         self._node_paths: dict[str, Path] = {}
         self._loaded: set[str] = set()
 
-        self.title("Create PMF Image")
+        self.title(title)
         self.geometry("920x680")
         self.minsize(720, 520)
         self.transient(master)
@@ -764,7 +870,7 @@ class CreateImageWindow(tk.Toplevel):
 
         header = ttk.Frame(self, style="Toolbar.TFrame", padding=(16, 12))
         header.pack(fill="x")
-        ttk.Label(header, text="Create PMF Image",
+        ttk.Label(header, text=title,
                   style="Toolbar.TLabel",
                   font=("Segoe UI Semibold", 13),
                   foreground=FG).pack(side="left")
@@ -824,20 +930,20 @@ class CreateImageWindow(tk.Toplevel):
         output.columnconfigure(1, weight=1)
         ttk.Label(output, text="Save in").grid(row=0, column=0, sticky="w",
                                                padx=(0, 10), pady=4)
-        self.output_dir = tk.StringVar(value=str(Path.home()))
-        ttk.Entry(output, textvariable=self.output_dir).grid(
+        self.output_dir = tk.StringVar(value=str(image_path.parent if image_path else Path.home()))
+        ttk.Entry(output, textvariable=self.output_dir, state="readonly" if image_path else "normal").grid(
             row=0, column=1, sticky="ew", pady=4)
         ttk.Button(output, text="Use Selected Folder",
-                   command=self._use_selected_output).grid(
+                   command=self._use_selected_output, state="disabled" if image_path else "normal").grid(
             row=0, column=2, padx=(8, 0), pady=4)
 
         ttk.Label(output, text="Image name").grid(row=1, column=0, sticky="w",
                                                   padx=(0, 10), pady=4)
-        self.image_name = tk.StringVar(value="backup.pmf")
-        name_entry = ttk.Entry(output, textvariable=self.image_name)
+        self.image_name = tk.StringVar(value=image_path.name if image_path else "backup.pmf")
+        name_entry = ttk.Entry(output, textvariable=self.image_name, state="readonly" if image_path else "normal")
         name_entry.grid(row=1, column=1, sticky="ew", pady=4)
 
-        self.hot_image = tk.BooleanVar(value=os.name == "nt")
+        self.hot_image = tk.BooleanVar(value=os.name == "nt" and image_path is None)
         ttk.Checkbutton(
             output,
             text="Hot image (Volume Shadow Copy)",
@@ -845,13 +951,25 @@ class CreateImageWindow(tk.Toplevel):
             state="normal" if os.name == "nt" else "disabled",
         ).grid(row=2, column=1, sticky="w", pady=(8, 2))
 
+        self.image_root = tk.BooleanVar(value=False)
+        self.preview = tk.BooleanVar(value=False)
+        self.delete_missing = tk.BooleanVar(value=True)
+        if image_path:
+            self.geometry("920x780")
+            ttk.Checkbutton(output, text="Source contents match image root (one folder/drive)",
+                            variable=self.image_root).grid(row=3, column=1, sticky="w")
+            ttk.Checkbutton(output, text="Mirror deletions in selected folders (kept in older versions)",
+                            variable=self.delete_missing).grid(row=4, column=1, sticky="w")
+            ttk.Checkbutton(output, text="Preview changes only — do not write",
+                            variable=self.preview).grid(row=5, column=1, sticky="w")
+
         footer = ttk.Frame(self, style="Toolbar.TFrame", padding=(16, 10))
         footer.pack(fill="x", side="bottom")
         self.feedback = ttk.Label(footer, text="", style="Toolbar.TLabel")
         self.feedback.pack(side="left", fill="x", expand=True)
         ttk.Button(footer, text="Cancel",
                    command=self.destroy).pack(side="right")
-        ttk.Button(footer, text="Create", style="Accent.TButton",
+        ttk.Button(footer, text="Update" if image_path else "Create", style="Accent.TButton",
                    command=self._create).pack(side="right", padx=(0, 8))
 
         self.bind("<Escape>", lambda _e: self.destroy())
@@ -947,13 +1065,18 @@ class CreateImageWindow(tk.Toplevel):
         if not name.lower().endswith(".pmf"):
             name += ".pmf"
         out_path = output_dir / name
-        if out_path.exists():
+        if out_path.exists() and self.image_path is None:
             self._feedback("An image with that name already exists.")
             return
         sources = list(self.sources)
+        hot, root, preview, deletions = (self.hot_image.get(), self.image_root.get(),
+                                         self.preview.get(), self.delete_missing.get())
         self.grab_release()
         self.destroy()
-        self.create_callback(out_path, sources, self.hot_image.get())
+        if self.image_path:
+            self.create_callback(self.image_path, sources, hot, root, preview, deletions)
+        else:
+            self.create_callback(out_path, sources, hot)
 
 
 class PreviewWindow(tk.Toplevel):

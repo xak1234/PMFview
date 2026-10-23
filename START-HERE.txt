@@ -1,0 +1,50 @@
+PMF Viewer — Windows x64 distribution
+
+1. Copy or unzip the whole PMFViewer folder to a local drive.
+2. Double-click PMFViewer.exe and choose Open Image.
+3. Browse, extract, create, or incrementally update a PMF image.
+
+No Python installation is needed. Keep the _internal folder with both EXEs.
+
+OPTIONAL: OPEN AN IMAGE AS A WINDOWS DRIVE
+Open Optional-Mounting\Download-WinFsp.url and install the official WinFsp
+2.1 MSI once on the receiving PC. The driver/DLL are not bundled.
+Then choose Mount Image in the viewer, select a free drive letter, and Mount.
+Read-only is the default. Tick Read/write to save changes into PMF revisions.
+Use Flush changes to confirm a save, then close open files and choose Unmount.
+Mounted drives keep running if you close the viewer. Reopen Mount Image to manage
+those drives. A writable mount locks out other updates until it is unmounted.
+
+CLI EXAMPLES (PowerShell, from this folder)
+.\pmf.exe "E:\Backups\backup.pmf" info
+.\pmf.exe "E:\Backups\backup.pmf" mount P: --read-write
+.\pmf.exe "E:\Backups\backup.pmf" mount-status
+.\pmf.exe "E:\Backups\backup.pmf" flush-mount P:
+.\pmf.exe "E:\Backups\backup.pmf" unmount P:
+.\pmf.exe "E:\Backups\backup.pmf" history
+.\pmf.exe --queue list
+
+MCP
+Configure your MCP client to launch the absolute path to pmf.exe with --mcp.
+Transport: stdio. Run under your own Windows user for Explorer-visible mounts.
+Restart an existing MCP server after replacing this distribution.
+
+DATA AND COMPATIBILITY
+Supports VIMG / Backup-All-Files PMF images. Edits append PMFViewer revisions;
+read the current version with this application. Native DiskGenius incremental
+restore and booting an image are not validated. This is a file-content mount,
+not a full NTFS implementation. See README.md for limitations and recovery.
+Large accessed files need equivalent local cache space. Older revisions remain
+stored. Keep separate backups of valuable images.
+
+Files/cache/queue state are stored outside this distribution in your user profile;
+image index/lock files live beside the image. No personal images or account
+configuration are bundled. Executables are locally built and unsigned; the
+optional WinFsp installer from the vendor is signed.
+WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos.
+https://github.com/winfsp/winfsp
+
+README.md             Full documentation and source-command examples
+Source\               Source and build recipe
+Third-Party\          Dependency versions, licences and source links
+SHA256SUMS.txt         Checksums of the distribution contents

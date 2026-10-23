@@ -1,0 +1,10 @@
+# Build the portable Windows x64 distribution with Python 3.10.
+pyinstaller==6.22.3
+mcp==1.27.2
+-r requirements-mount.txt
+# Runtime versions validated with the MCP stdio and Windows mount integration tests.
+pydantic==2.13.4
+pydantic-settings==2.14.1
+anyio==4.13.0
+starlette==0.52.1
+cffi==2.0.0
