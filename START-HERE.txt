@@ -28,6 +28,9 @@ MCP
 Configure your MCP client to launch the absolute path to pmf.exe with --mcp.
 Transport: stdio. Run under your own Windows user for Explorer-visible mounts.
 Restart an existing MCP server after replacing this distribution.
+File previews default to 4 KiB and have a hard 32 KiB request limit.
+Listings are paginated. pmf_job returns status only unless include_result=True;
+saved results then use 4 KiB pages (8 KiB maximum). See README for continuations.
 
 DATA AND COMPATIBILITY
 Supports VIMG / Backup-All-Files PMF images. Edits append PMFViewer revisions;

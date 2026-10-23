@@ -19,7 +19,8 @@ import inspect
 import json
 import hashlib
 import threading
-from collections.abc import Callable
+from collections import OrderedDict
+from collections.abc import Callable, Iterable, Iterator
 from functools import wraps
 from typing import ParamSpec, cast
 import os
@@ -45,12 +46,17 @@ mcp = FastMCP(
         "pmf_write replaces complete file contents; pmf_import imports a local file. "
         "Use expected_revision to prevent overwriting a newer edit. "
         "All image operations enter a persistent FIFO queue. Calls wait briefly, "
-        "then return a job ID if still running; use pmf_job for status/results. "
+        "then return a job ID if still running; use pmf_job for status and "
+        "include_result=True for a bounded result page. Read only the file/range "
+        "needed for the task: pmf_stat first, then pmf_read (4 KiB default, 32 KiB "
+        "maximum). Listings are paginated; use next_offset and the reported revision. "
+        "File contents and the full index are never included in open/list responses. "
+        "Extraction saves files locally and returns a summary, not file contents. "
         "Processed requests remain until acknowledged (records are retained)."
     ),
 )
 
-_images: dict[tuple[str, int | None], PmfImage] = {}
+_images: OrderedDict[tuple[str, int | None], PmfImage] = OrderedDict()
 _tool_lock = threading.RLock()
 _queue_lock = threading.RLock()
 _operations: dict[str, Operation] = {}
@@ -60,6 +66,44 @@ P = ParamSpec('P')
 READ = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False)
 WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False)
 EXTRACT = ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False)
+MAX_RESPONSE_BYTES = 65536
+PAGE_BYTES = 24576
+MAX_READ_BYTES = 32768
+MAX_HEX_BYTES = 4096
+MAX_CACHED_IMAGES = 2
+
+
+def _clip(text: str, budget: int, notice: str = '\n[display truncated]') -> str:
+    raw = text.encode('utf-8', errors='replace')
+    if len(raw) <= budget:
+        return text
+    return raw[:budget - len(notice.encode('utf-8'))].decode('utf-8', errors='ignore') + notice
+
+
+def _number(name: str, value: int, minimum: int, maximum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+        raise PmfError(f'{name} must be between {minimum} and {maximum}')
+    return value
+
+
+def _page(rows: Iterable[str], offset: int, limit: int, label: str) -> str:
+    """Stop before either the row or byte budget; offsets count rows, not bytes."""
+    _number('offset', offset, 0, (1 << 63) - 2)
+    out: list[str] = []
+    used, more = 0, False
+    for index, row in enumerate(rows):
+        if index < offset:
+            continue
+        line = _clip(row, 8192)
+        size = len(line.encode('utf-8')) + 1
+        if len(out) >= limit or used + size > PAGE_BYTES:
+            more = True
+            break
+        out.append(line)
+        used += size
+    next_offset = str(offset + len(out)) if more else 'none'
+    return ('\n'.join(out) if out else '(no entries in this page)') + (
+        f'\n[{label}; returned={len(out)}; offset={offset}; next_offset={next_offset}]')
 
 
 def _tool(annotations: ToolAnnotations) -> Callable[[Callable[P, str]], Callable[P, str]]:
@@ -67,8 +111,14 @@ def _tool(annotations: ToolAnnotations) -> Callable[[Callable[P, str]], Callable
     def register(function: Callable[P, str]) -> Callable[P, str]:
         @wraps(function)
         async def run(*args: P.args, **kwargs: P.kwargs) -> str:
-            return await asyncio.to_thread(function, *args, **kwargs)
-        mcp.tool(annotations=annotations)(run)
+            try:
+                result = await asyncio.to_thread(function, *args, **kwargs)
+                return _clip(result, MAX_RESPONSE_BYTES,
+                             '\n[response limit reached; narrow the request or use pagination]')
+            except Exception as exc:
+                raise PmfError(_clip(str(exc), 2048)) from None
+        # Plain text is sufficient; avoid duplicating file contents in structuredContent.
+        mcp.tool(annotations=annotations, structured_output=False)(run)
         return function
     return register
 
@@ -118,11 +168,14 @@ def _queued(function: Callable[P, str]) -> Callable[P, str]:
             arguments['sources'] = [str(Path(p).expanduser().absolute()) for p in arguments['sources']]
         queue = _queue()
         job_id = queue.submit(function.__name__, arguments)
-        job = queue.wait(job_id, timeout=20)
+        job = queue.wait(job_id, timeout=20, result_limit=MAX_RESPONSE_BYTES - 1024, error_limit=2048)
         if job['state'] in ('failed', 'interrupted'):
             raise PmfError(f"Job {job_id} {job['state']}: {job['error']}")
         if job['state'] == 'completed':
-            return f"Job {job_id}: completed\n{job['result']}"
+            continuation = (f"\n[more result: pmf_job({job_id}, include_result=True, "
+                            f"result_offset={job['next_result_offset']})]"
+                            if job.get('result_truncated') else '')
+            return f"Job {job_id}: completed\n{job['result']}" + continuation
         return (f"Job {job_id}: {job['state']}. Request retained; use pmf_job to check results."
                 + (f" Worker error: {job['worker_error']}" if job.get('worker_error') else ''))
     return call
@@ -150,6 +203,8 @@ def _get(image_path: str, revision: int | None = None) -> PmfImage:
             _drop(image_path)
             img = None
     if img is None:
+        while len(_images) >= MAX_CACHED_IMAGES:
+            _images.popitem(last=False)[1].close()
         img = PmfImage(p, revision=revision)
         try:
             img.load_index(progress=False)
@@ -157,6 +212,7 @@ def _get(image_path: str, revision: int | None = None) -> PmfImage:
             img.close()
             raise
         _images[key] = img
+    _images.move_to_end(key)
     return img
 
 
@@ -205,81 +261,81 @@ def pmf_info(image_path: str) -> str:
 
 @_tool(annotations=READ)
 @_queued
-def pmf_ls(image_path: str, path: str = "", limit: int = 500) -> str:
-    """List a directory inside the image. `path` like 'Users\\me\\Documents'
-    ('' = root). Returns 'mtime size|<DIR> name' lines, capped at `limit`."""
-    img = _get(image_path)
+def pmf_ls(image_path: str, path: str = "", limit: int = 50, offset: int = 0,
+           revision: int | None = None) -> str:
+    """List one directory, without file contents. 1-200 entries per page (default 50).
+
+    Follow next_offset with the same path and reported revision. Pages also have
+    a 24 KiB text budget. '' means root; directory listing does not recurse.
+    """
+    _number('limit', limit, 1, 200)
+    _number('offset', offset, 0, (1 << 63) - 2)
+    img = _get(image_path, revision)
     recno = img.resolve(path)
     if recno is None:
         raise PmfError(f"path not found in image: {path}")
     e = img.entries.get(recno)
-    if e is not None and not e.is_dir and recno != img.root_recno:
-        return _line(img, e, with_path=True)
-    kids = img.children.get(recno, [])
-    lines = [_line(img, img.entries[r]) for r in kids[:limit]]
-    extra = f"\n... {len(kids) - limit} more entries (raise limit to see them)" if len(kids) > limit else ""
-    return "\n".join(lines) + extra + f"\n\n{len(kids)} entries total"
-
+    kids = [recno] if e is not None and not e.is_dir else img.children.get(recno, [])
+    return _page((_line(img, img.entries[r]) for r in kids), offset, limit,
+                 f'revision={img.revision}; total={len(kids)}')
 
 @_tool(annotations=READ)
 @_queued
-def pmf_tree(image_path: str, path: str = "", depth: int = 2, max_lines: int = 300) -> str:
-    """Directory tree of a path inside the image, `depth` levels deep."""
-    img = _get(image_path)
+def pmf_tree(image_path: str, path: str = "", depth: int = 2, max_lines: int = 50,
+             offset: int = 0, revision: int | None = None) -> str:
+    """Page through a directory tree: depth 1-8, max_lines 1-200 (default 50).
+
+    No file contents. Follow next_offset with the same depth/path/revision.
+    """
+    _number('depth', depth, 1, 8)
+    _number('max_lines', max_lines, 1, 200)
+    _number('offset', offset, 0, (1 << 63) - 2)
+    img = _get(image_path, revision)
     recno = img.resolve(path)
     if recno is None:
         raise PmfError(f"path not found in image: {path}")
-    out: list[str] = [img.full_path(recno) or "\\"]
-    truncated = False
 
-    def rec(r: int, prefix: str, d: int) -> None:
-        nonlocal truncated
-        if truncated:
-            return
+    def rows(r: int, prefix: str, remaining: int) -> Iterator[str]:
         kids = img.children.get(r, [])
-        for i, k in enumerate(kids):
-            if len(out) >= max_lines:
-                truncated = True
-                return
-            e = img.entries[k]
+        for i, child in enumerate(kids):
+            e = img.entries[child]
             last = i == len(kids) - 1
-            tag = "" if e.is_dir else f"  ({human(e.size)})"
-            out.append(f"{prefix}{'└── ' if last else '├── '}{e.name}{tag}")
-            if e.is_dir and d > 1:
-                rec(k, prefix + ("    " if last else "│   "), d - 1)
+            tag = '' if e.is_dir else f'  ({human(e.size)})'
+            yield f"{prefix}{'└── ' if last else '├── '}{e.name}{tag}"
+            if e.is_dir and remaining > 1:
+                yield from rows(child, prefix + ('    ' if last else '│   '), remaining - 1)
 
-    rec(recno, "", depth)
-    if truncated:
-        out.append(f"... truncated at {max_lines} lines")
-    return "\n".join(out)
+    def all_rows() -> Iterator[str]:
+        yield img.full_path(recno) or chr(92)
+        yield from rows(recno, '', depth)
 
+    return _page(all_rows(), offset, max_lines, f'revision={img.revision}; depth={depth}')
 
 @_tool(annotations=READ)
 @_queued
-def pmf_find(image_path: str, pattern: str, limit: int = 100, path_glob: bool = False) -> str:
-    """Search files by name: substring match, or glob if the pattern contains
-    * ? [. With path_glob=True the glob is matched against the full path
-    (e.g. 'Users\\*\\Documents\\*.xlsx'). Returns matching entries with paths."""
+def pmf_find(image_path: str, pattern: str, limit: int = 50, path_glob: bool = False,
+             offset: int = 0, revision: int | None = None) -> str:
+    """Find names by substring or glob (* ? [); never search/return file contents.
+
+    path_glob matches the full image path. Returns 1-200 matches per page
+    (default 50); follow next_offset with the same pattern and revision.
+    """
     import fnmatch
 
-    img = _get(image_path)
-    pat = pattern.lower().replace("/", "\\")
-    is_glob = path_glob or any(c in pat for c in "*?[")
-    lines = []
-    for e in img.entries.values():
-        if path_glob:
-            hay = img.full_path(e.recno).lower()
-            hit = fnmatch.fnmatch(hay, pat.strip("\\"))
-        else:
-            name = e.name.lower()
-            hit = fnmatch.fnmatch(name, pat) if is_glob else pat in name
-        if hit:
-            lines.append(_line(img, e, with_path=True))
-            if len(lines) >= limit:
-                lines.append(f"... stopped at {limit} matches")
-                break
-    return "\n".join(lines) if lines else "no matches"
+    _number('limit', limit, 1, 200)
+    _number('offset', offset, 0, (1 << 63) - 2)
+    img = _get(image_path, revision)
+    pat = pattern.lower().replace('/', chr(92))
+    is_glob = path_glob or any(c in pat for c in '*?[')
 
+    def rows() -> Iterator[str]:
+        for e in img.entries.values():
+            hay = img.full_path(e.recno).lower() if path_glob else e.name.lower()
+            hit = fnmatch.fnmatch(hay, pat.strip(chr(92))) if is_glob else pat in hay
+            if hit:
+                yield _line(img, e, with_path=True)
+
+    return _page(rows(), offset, limit, f'revision={img.revision}; matches')
 
 @_tool(annotations=READ)
 @_queued
@@ -301,48 +357,40 @@ def pmf_stat(image_path: str, path: str) -> str:
 
 @_tool(annotations=READ)
 @_queued
-def pmf_read(image_path: str, path: str, offset: int = 0, length: int = 16384,
+def pmf_read(image_path: str, path: str, offset: int = 0, length: int = 4096,
              revision: int | None = None) -> str:
-    """Read file content from inside the image (no extraction). Returns text
-    when decodable, otherwise a hex dump. length is capped at 262144 bytes. Partial reads are previews; pmf_hash verifies
-    the whole file. revision=None reads the latest committed version."""
+    """Preview exactly one file range: default 4 KiB, hard maximum 32 KiB.
+
+    Text is decoded as UTF-8; binary uses hex (at most 4096 displayed bytes).
+    Follow next_offset for more, using the reported revision. Ranges skip
+    preceding data chunks; they do not verify skipped data. pmf_hash verifies
+    the whole file locally. No automatic full-file extraction or content upload.
+    """
+    _number('offset', offset, 0, (1 << 63) - 2)
+    _number('length', length, 1, MAX_READ_BYTES)
     img = _get(image_path, revision)
     e = _entry(img, path)
-    if e.is_dir:
-        raise PmfError(f"{path} is a directory")
-    if offset < 0 or length <= 0:
-        raise PmfError("offset must be nonnegative and length must be positive")
-    length = min(length, 262144)
-    end = offset + length
-    buf = bytearray()
-    pos = 0
-    for chunk in img.iter_file_data(e):
-        nxt = pos + len(chunk)
-        if nxt > offset:
-            buf += chunk[max(0, offset - pos) : max(0, end - pos)]
-        pos = nxt
-        if pos >= end and end < e.size:
-            break
-    data = bytes(buf)
-    head = f"[{img.full_path(e.recno)} bytes {offset}..{offset+len(data)} of {e.size:,}]\n"
-    if not data:
-        return head + "(no data in range)"
+    data = img.read_file_range(e, offset, length)
     printable = sum(32 <= b < 127 or b in (9, 10, 13) for b in data)
-    if printable / len(data) > 0.85:
-        try:
-            return head + data.decode("utf-8")
-        except UnicodeDecodeError:
-            return head + data.decode("utf-8", errors="replace")
-    lines = []
-    for i in range(0, min(len(data), 4096), 16):
-        row = data[i : i + 16]
-        hx = " ".join(f"{b:02x}" for b in row)
-        asc = "".join(chr(b) if 32 <= b < 127 else "." for b in row)
-        lines.append(f"{offset+i:08x}  {hx:<48}  {asc}")
-    if len(data) > 4096:
-        lines.append("... hex dump capped at 4096 bytes (read more with offset)")
-    return head + "\n".join(lines)
-
+    is_text = bool(data) and printable / len(data) > 0.85
+    if is_text:
+        body = data.decode('utf-8', errors='replace')
+        shown = len(data)
+    elif data:
+        shown = min(len(data), MAX_HEX_BYTES)
+        lines = []
+        for i in range(0, shown, 16):
+            row = data[i:i + 16]
+            hx = ' '.join(f'{b:02x}' for b in row)
+            asc = ''.join(chr(b) if 32 <= b < 127 else '.' for b in row)
+            lines.append(f'{offset+i:08x}  {hx:<48}  {asc}')
+        body = '\n'.join(lines)
+    else:
+        shown, body = 0, '(no data in range)'
+    next_offset = str(offset + shown) if offset + shown < e.size else 'none'
+    name = _clip(img.full_path(e.recno), 2048)
+    return (f'[{name}; revision={img.revision}; bytes={offset}..{offset + shown} '
+            f'of {e.size}; returned_bytes={shown}; next_offset={next_offset}]\n' + body)
 
 @_tool(annotations=READ)
 @_queued
@@ -366,7 +414,8 @@ def pmf_extract(image_path: str, paths: list[str], out_dir: str, quiet: bool = T
                 revision: int | None = None) -> str:
     """Extract files/directories from the image to a local folder.
     Directories recurse; entries keep their relative layout under out_dir.
-    Modification times are preserved. Returns a result summary."""
+    Modification times are preserved. File contents stay on local disk;
+    MCP receives only counts (or at most 20 names when quiet=False)."""
     import fnmatch
 
     from pmfview import extract_file, extraction_target, make_extraction_directory
@@ -412,12 +461,12 @@ def pmf_extract(image_path: str, paths: list[str], out_dir: str, quiet: bool = T
             try:
                 extract_file(img, e, dest)
                 ok += 1
-                if not quiet and len(extracted) < 100:
-                    extracted.append(f"{full} ({human(e.size)})")
+                if not quiet and len(extracted) < 20:
+                    extracted.append(_clip(f"{full} ({human(e.size)})", 1024))
             except (PmfError, OSError) as ex:
                 fail += 1
-                if len(errors) < 20:
-                    errors.append(f"{full}: {ex}")
+                if len(errors) < 10:
+                    errors.append(_clip(f"{full}: {ex}", 1024))
 
     result = f"Extracted {ok} file(s) to {out}"
     if fail:
@@ -429,12 +478,14 @@ def pmf_extract(image_path: str, paths: list[str], out_dir: str, quiet: bool = T
 
 @_tool(annotations=READ)
 @_queued
-def pmf_history(image_path: str) -> str:
-    """List committed revisions. Pass a revision to pmf_read or pmf_extract to read it."""
+def pmf_history(image_path: str, limit: int = 20, offset: int = 0) -> str:
+    """List revision metadata only, 1-100 rows per page (default 20)."""
+    _number('limit', limit, 1, 100)
+    _number('offset', offset, 0, (1 << 63) - 2)
     img = _get(image_path)
     rows = img.revisions or [{'revision': 0, 'created': img.header.created, 'summary': 'Original image'}]
-    return '\n'.join(f"{r['revision']}: {r['created']}  {r['summary']}" for r in rows)
-
+    return _page((f"{r['revision']}: {r['created']}  {r['summary']}" for r in rows),
+                 offset, limit, f'total={len(rows)} revisions')
 
 @_tool(annotations=WRITE)
 @_queued
@@ -492,16 +543,31 @@ def pmf_update(image_path: str, sources: list[str], image_root: bool = False,
 
 
 @_tool(annotations=READ)
-def pmf_jobs(limit: int = 50, include_acknowledged: bool = False) -> str:
-    """List durable request IDs/states. Pending and processed results are never auto-deleted."""
-    return json.dumps(_queue().jobs(limit, include_acknowledged), indent=2)
-
+def pmf_jobs(limit: int = 20, include_acknowledged: bool = False, offset: int = 0) -> str:
+    """List job metadata only (no arguments/results), 1-100 rows per page."""
+    _number('limit', limit, 1, 100)
+    _number('offset', offset, 0, (1 << 63) - 2)
+    rows = _queue().jobs(limit + 1, include_acknowledged, offset)
+    return json.dumps({'jobs': rows[:limit],
+                       'next_offset': offset + limit if len(rows) > limit else None}, indent=2)
 
 @_tool(annotations=READ)
-def pmf_job(job_id: int, wait_seconds: float = 0) -> str:
-    """Get a queued request's status, result or error; optionally wait up to 60 seconds."""
-    return json.dumps(_queue().wait(job_id, timeout=wait_seconds), indent=2, ensure_ascii=False)
+def pmf_job(job_id: int, wait_seconds: float = 0, include_result: bool = False,
+            result_offset: int = 0, result_length: int = 4096) -> str:
+    """Get status without file contents by default; optionally wait up to 60 seconds.
 
+    include_result=True returns a saved-result page (4-8192 UTF-8 bytes, default
+    4096). Follow next_result_offset. Request arguments are never returned.
+    These limits also apply to old jobs created before response limits existed.
+    """
+    _number('job_id', job_id, 1, (1 << 63) - 1)
+    _number('result_offset', result_offset, 0, (1 << 31) - 2)
+    _number('result_length', result_length, 4, 8192)
+    if not 0 <= wait_seconds <= 60:
+        raise PmfError('wait_seconds must be between 0 and 60')
+    return json.dumps(_queue().wait(job_id, timeout=wait_seconds,
+        include_result=include_result, result_offset=result_offset,
+        result_limit=result_length, error_limit=1024), indent=2, ensure_ascii=False)
 
 @_tool(annotations=WRITE)
 def pmf_acknowledge(job_id: int) -> str:

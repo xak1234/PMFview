@@ -595,6 +595,102 @@ class PmfImage:
                 return bytes(out[:max_bytes])
         return bytes(out)
 
+    def _zlib_range(self, start: int, compressed: int, offset: int, length: int) -> bytes:
+        """Decode only a selected stream prefix, with 64 KiB input/output buffers."""
+        self.f.seek(start)
+        decoder = zlib.decompressobj()
+        pending = b''
+        remaining, produced = compressed, 0
+        end = offset + length
+        out = bytearray()
+        try:
+            while produced < end:
+                if not pending and remaining:
+                    size = min(remaining, 65536)
+                    pending = self.f.read(size)
+                    if len(pending) != size:
+                        raise PmfError('Truncated compressed data')
+                    remaining -= size
+                block = decoder.decompress(pending, min(65536, end - produced))
+                pending = decoder.unconsumed_tail
+                out.extend(block[max(0, offset - produced):])
+                produced += len(block)
+                if decoder.eof and produced < end:
+                    raise PmfError('Compressed data is shorter than the requested range')
+                if not block and not pending and not remaining and produced < end:
+                    raise PmfError('Incomplete compressed data')
+        except zlib.error as exc:
+            raise PmfError(f'Corrupt compressed data: {exc}') from exc
+        return bytes(out)
+
+    def read_file_range(self, entry: Entry, offset: int, length: int) -> bytes:
+        """Read just a byte range; skip earlier chunk payloads with seeks.
+
+        Partial reads do not verify skipped data or the whole-file checksum.
+        Memory follows the requested range, not the image/file/chunk size.
+        """
+        if offset < 0 or length <= 0:
+            raise PmfError('offset must be nonnegative and length must be positive')
+        if entry.is_dir:
+            raise PmfError(f'{entry.name} is a directory')
+        if offset >= entry.size:
+            return b''
+        end = min(entry.size, offset + length)
+        header = self._blob_header(entry.blob)
+        if header is None:
+            raise PmfError(f'unreadable blob @0x{entry.blob:X}')
+        _, decoded, compressed = header
+        if not 0 < decoded <= 16 << 20:
+            raise PmfError('Metadata exceeds the 16 MiB range-read limit')
+        position = entry.blob + BLOB_HDR + compressed
+        if position > self.committed_end:
+            raise PmfError('Metadata stream extends outside the image')
+        metadata = self._zlib_range(entry.blob + BLOB_HDR, compressed, 0, decoded)
+        attribute = next((a for a in self.parse_attrs(metadata)
+                          if a.atype == ATTR_DATA and not a.name), None)
+        out = bytearray()
+        if attribute is not None and not attribute.nonres:
+            content = metadata[attribute.content_off:attribute.content_off + attribute.content_len]
+            out.extend(content[offset:end])
+            out.extend(b'\x00' * (end - offset - len(out)))
+        else:
+            initialized = attribute.init_size if attribute is not None else entry.size
+            produced = 0
+            while produced < end:
+                if produced >= initialized:
+                    out.extend(b'\x00' * (end - max(offset, produced)))
+                    break
+                self.f.seek(position)
+                chunk_header = self.f.read(8)
+                if len(chunk_header) != 8:
+                    raise PmfError('Truncated data chunk header')
+                chunk_size, stored_size = struct.unpack('<II', chunk_header)
+                if not (0 < chunk_size <= CHUNK_MAX and 0 < stored_size < 1 << 30
+                        and position + 8 + stored_size <= self.committed_end):
+                    raise PmfError(f'Invalid data chunk @0x{position:X}')
+                next_position = min(entry.size, produced + chunk_size)
+                if next_position > offset:
+                    local_start = max(0, offset - produced)
+                    count = min(next_position, end) - max(offset, produced)
+                    if stored_size == chunk_size:
+                        self.f.seek(position + 8 + local_start)
+                        block = self.f.read(count)
+                        if len(block) != count:
+                            raise PmfError('Truncated raw data chunk')
+                    else:
+                        block = self._zlib_range(position + 8, stored_size, local_start, count)
+                    out.extend(block)
+                produced = next_position
+                position += 8 + stored_size
+        result = bytes(out)
+        if len(result) != end - offset:
+            raise PmfError('Incomplete file range')
+        expected = self.file_hashes.get(entry.recno)
+        if offset == 0 and end == entry.size and expected:
+            if hashlib.sha256(result).hexdigest() != expected:
+                raise PmfError(f'Incremental file checksum failed: {entry.name}')
+        return result
+
     # ---------- paths ----------
 
     def full_path(self, recno: int) -> str:

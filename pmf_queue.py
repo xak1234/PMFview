@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import contextlib
 import json
 import os
@@ -67,35 +68,65 @@ class JobQueue:
         self.wake.set()
         return job_id
 
-    def get(self, job_id: int) -> dict[str, Any]:
+    def get(self, job_id: int, *, include_result: bool = True, result_offset: int = 0,
+            result_limit: int | None = None, error_limit: int | None = None) -> dict[str, Any]:
+        """Select metadata or a bounded UTF-8 byte page; never load request arguments."""
+        # Older SQLite builds use signed 32-bit substr lengths. Passing 2**63-1
+        # can wrap to -1 and return an empty result on Windows/Python 3.10.
+        sql_max = (1 << 31) - 1
+        if not 0 <= result_offset < sql_max or (result_limit is not None
+                                                and not 4 <= result_limit <= sql_max):
+            raise ValueError('Invalid result byte offset or page size')
+        if error_limit is not None and not 1 <= error_limit <= sql_max:
+            raise ValueError('Invalid error limit')
         with self._db() as db:
-            row = db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+            row = db.execute('''SELECT id,operation,state,created,started,finished,acknowledged,
+                result IS NOT NULL AS result_available,
+                CASE WHEN ? THEN length(CAST(result AS BLOB)) ELSE NULL END AS result_bytes,
+                CASE WHEN ? THEN substr(CAST(result AS BLOB), ?, ?) ELSE NULL END AS result,
+                substr(error,1,?) AS error
+                FROM jobs WHERE id=?''',
+                (include_result, include_result, result_offset + 1,
+                 result_limit if result_limit is not None else sql_max,
+                 error_limit if error_limit is not None else sql_max, job_id)).fetchone()
         if row is None:
             raise ValueError(f'Job {job_id} does not exist')
         result = dict(row)
-        result.pop('arguments')  # Request contents stay local; status does not echo file content.
+        if result['result'] is not None:
+            raw = result['result']
+            total = result['result_bytes']
+            decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+            result['result'] = decoder.decode(raw, final=result_offset + len(raw) >= total)
+            consumed = len(raw) - len(decoder.getstate()[0])
+            result['result_offset'] = result_offset
+            result['result_truncated'] = result_offset + consumed < total
+            result['next_result_offset'] = result_offset + consumed if result['result_truncated'] else None
         return result
 
-    def jobs(self, limit: int = 50, include_acknowledged: bool = False) -> list[dict[str, Any]]:
+    def jobs(self, limit: int = 50, include_acknowledged: bool = False,
+             offset: int = 0) -> list[dict[str, Any]]:
         with self._db() as db:
             rows = db.execute('''SELECT id,operation,state,created,started,finished,acknowledged
-                FROM jobs WHERE (? OR acknowledged=0) ORDER BY id DESC LIMIT ?''',
-                (include_acknowledged, max(1, min(limit, 500)))).fetchall()
+                FROM jobs WHERE (? OR acknowledged=0) ORDER BY id DESC LIMIT ? OFFSET ?''',
+                (include_acknowledged, max(1, min(limit, 500)), max(0, offset))).fetchall()
         return [dict(r) for r in rows]
 
-    def wait(self, job_id: int, timeout: float = 20) -> dict[str, Any]:
+    def wait(self, job_id: int, timeout: float = 20, *, include_result: bool = True,
+             result_offset: int = 0, result_limit: int | None = None,
+             error_limit: int | None = None) -> dict[str, Any]:
         deadline = time.monotonic() + max(0, min(timeout, 60))
         while True:
-            job = self.get(job_id)
+            job = self.get(job_id, include_result=False, error_limit=error_limit)
             if job['state'] in TERMINAL or time.monotonic() >= deadline:
-                return job
+                return self.get(job_id, include_result=include_result, result_offset=result_offset,
+                                result_limit=result_limit, error_limit=error_limit)
             if self.worker_error:
                 job['worker_error'] = self.worker_error
                 return job
             self.stop.wait(min(0.05, max(0, deadline - time.monotonic())))
 
     def acknowledge(self, job_id: int) -> None:
-        if self.get(job_id)['state'] not in TERMINAL:
+        if self.get(job_id, include_result=False)['state'] not in TERMINAL:
             raise ValueError('Only processed/interrupted jobs can be acknowledged')
         with self._db() as db:
             db.execute('UPDATE jobs SET acknowledged=1 WHERE id=?', (job_id,))

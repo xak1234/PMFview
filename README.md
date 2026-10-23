@@ -180,7 +180,7 @@ New tools:
 | `pmf_mount_status(image_path)` | List mounts, revisions, errors and recovery folders. |
 | `pmf_flush_mount(image_path, drive)` | Commit pending mount changes. |
 | `pmf_unmount(image_path, drive)` | Flush and unmount; refuses while files remain open. |
-| `pmf_history(image_path)` | List committed revisions. |
+| `pmf_history(image_path, limit=20, offset=0)` | Page through committed revision metadata. |
 | `pmf_write(image_path, path, content, encoding="utf-8", expected_revision=None)` | Create/replace complete file contents. Use `base64` for binary; up to 1 MiB decoded. |
 | `pmf_import(image_path, source_path, path, expected_revision=None)` | Stream a local file into the image; suitable for large files. |
 | `pmf_update(image_path, sources, image_root=False, hot_image=False, delete_missing=False, dry_run=True, expected_revision=None)` | Preview or commit a folder backup. Set `dry_run=False` to write. |
@@ -210,15 +210,69 @@ service; no drive-letter mount is required.
   (e.g. `"Users\*\Documents\*.xlsx"`). File modification times are preserved.
 - Paths are case-insensitive; a leading `C:\` is accepted and ignored.
 
+### Bounded MCP reads for large images
+
+A 200 GiB image is accessed locally. Opening it builds/loads the file metadata
+index and returns a small summary; it does not send the image, full index or
+file contents to the model. Prefer `pmf_stat` for size/metadata, then request
+only the required file range. MCP returns plain text once, without a second
+copy in `structuredContent`.
+
+| Operation | Default | Hard limit / continuation |
+|---|---|---|
+| `pmf_read` | 4 KiB from one file | 32 KiB requested bytes; use `next_offset` |
+| Binary hex preview | Up to 4 KiB displayed bytes | `next_offset` advances by displayed bytes only |
+| `pmf_ls`, `pmf_find` | 50 entries | 200 entries and a 24 KiB row budget per page |
+| `pmf_tree` | 50 lines, depth 2 | 200 lines, depth 8, 24 KiB row budget |
+| `pmf_history` | 20 revisions | 100 revisions and a 24 KiB row budget |
+| `pmf_jobs` | 20 job summaries | 100 per page; no arguments or result contents |
+| `pmf_job` | Status only | `include_result=True` requests a result page; 4 KiB default, 8 KiB maximum |
+| `pmf_extract` | Counts and local destination | Contents stay on disk; `quiet=False` lists at most 20 names |
+
+Read/list limits outside these bounds are rejected, including negative limits;
+they cannot request an unlimited response. Every tool's response text also has
+a final 64 KiB UTF-8 ceiling, before JSON transport escaping. This is a size
+limit, not an exact model-token limit. Long display rows are marked as truncated.
+
+Listing offsets count rows. File-read offsets count file bytes; saved-job result
+offsets count UTF-8 bytes. Use each response's next offset. Pass the same
+`revision` on subsequent file/list/tree/search pages to keep the view consistent
+while the image is updated. Job lists are newest-first and can move when new
+jobs are submitted; use their stable IDs for subsequent status/result requests.
+
+Range reads seek past earlier file chunks, then read only the requested bytes
+from raw chunks or decompress the necessary prefix of overlapping compressed
+chunks using bounded buffers. Reads beyond EOF return immediately. A partial
+read is a preview: skipped data is not checked. `pmf_hash` deliberately reads
+the complete selected file locally and returns only its hash. Metadata streams
+over 16 MiB are rejected by range reads. At most two image/revision indexes are
+cached per MCP process; index memory still depends on the number of entries.
+
+These are response limits, not file-access permissions: the server still uses
+its Windows account's access. CLI commands retain full access, and explicit
+directory extraction can write many files locally. No automatic full-image
+content read or extraction is triggered by a preview.
+
+Example: read a 1 KiB range, then explicitly fetch a queued result if needed:
+
+```json
+{"name":"pmf_read","arguments":{"image_path":"E:\\backups\\work.pmf","path":"Documents\\notes.txt","offset":4096,"length":1024}}
+{"name":"pmf_job","arguments":{"job_id":12,"include_result":true,"result_offset":0,"result_length":4096}}
+```
+
 ## Persistent MCP request queue
 
 Every MCP image operation is persisted in a SQLite FIFO queue before execution.
 One worker processes requests in submission order, including reads after writes.
 The MCP transport remains available to accept more requests during long work.
 Calls wait up to 20 seconds; if still pending/running, the response returns a job
-ID. Use `pmf_job(job_id, wait_seconds=0)` to retrieve its status/result/error.
+ID. Use `pmf_job(job_id, wait_seconds=0)` for status/error. File contents are
+omitted unless `include_result=True`; saved results are retrieved in bounded
+pages, including results written by older versions. The default page is 4096
+UTF-8 bytes, with `next_result_offset` to continue. Request arguments are never
+echoed in status/results. Complete saved results remain available through CLI.
 
-- `pmf_jobs(limit=50, include_acknowledged=False)` lists retained jobs.
+- `pmf_jobs(limit=20, include_acknowledged=False, offset=0)` lists retained jobs.
 - `pmf_acknowledge(job_id)` marks a processed job reviewed; its record remains.
 - `pmf_retry(job_id)` creates a new request from a failed/interrupted one.
 - Pending jobs resume on MCP server restart (or when the CLI queue worker runs).
@@ -293,6 +347,11 @@ The tests cover unchanged base bytes, small incremental growth, additions,
 modifications, deletions, old revisions, interrupted writes, checksum failure,
 source changes, MCP cache refresh, read/write/import/extraction and an actual
 MCP stdio session. Install the MCP SDK to run those integration cases.
+Read-limit tests cover exact text/binary continuations, rejected excessive and
+negative limits, pagination, old oversized SQLite results, and a real sparse
+200 GiB PMF fixture. The sparse test reads its tail while asserting less than
+16 KiB of metadata/chunk headers and requested payload reaches the range reader;
+it does not allocate or copy 200 GiB of data. Windows requires sparse-file support.
 Windows tests additionally mount disposable images on an unused drive, exercise
 random writes/truncation, copy/rename/replace/delete, validate earlier revisions,
 and test CLI plus queued MCP mount controls. They require WinFsp and its bindings.
